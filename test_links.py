@@ -26,7 +26,7 @@ def run(q):
 
 # (query, expect_link: True=must have, False=must NOT have, None=don't care)
 TEST_CASES = [
-    ("lbpm怎么打分",               True),
+    ("绩效怎么打分",               True),
     ("绩效考核评级标准是什么",         True),
     ("Q3 OKR怎么设定",              False),
     ("季度绩效奖金怎么发",             True),

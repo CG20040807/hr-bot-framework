@@ -190,7 +190,7 @@ _TOPIC_LINKS: list[dict] = [
 ]
 
 
-# 查询分词：ASCII 单词、数字串、CJK 连续串分别切出，避免把 "LBPM培训资料"
+# 查询分词：ASCII 单词、数字串、CJK 连续串分别切出，避免把 "绩效培训资料"
 # 这类混合串当成一个永远匹配不到的巨型 token（\w 在 Python 会连 CJK 一起吞）
 _QUERY_TERM_RE = re.compile(r'[a-z]{2,}|[0-9]{2,}')
 
@@ -292,7 +292,7 @@ def _curate_links(contexts: list[str], query: str = "",
 
     # 机制一：文档级规范链接——内容 + 标题双重核查。
     # ① _chunk_in_reply：chunk 实质内容确实出现在 reply 里才算被引用。
-    # ② topic guard：新员工指引是"大全文档"，嵌入了 LBPM/团建/福利等内容，
+    # ② topic guard：新员工指引是"大全文档"，嵌入了 绩效/团建/福利 等内容，
     #    非入职类查询不推其链接，避免乱入。
     # ③ 文件名相关性：对所有通过①②的候选，优先推文件名与查询关键词匹配的文件。
     # 扫描范围：top-3（而非 top-2），让真正的专项文档有机会被发现（避免被
@@ -594,11 +594,11 @@ def _lookup_open_id(name: str) -> Optional[str]:
             )
             return [l.strip().strip('"') for l in r.stdout.strip().splitlines() if l.strip()]
 
-        # Pass 1: exact localized_name match (e.g. "tommy.tang" in "Tommy.tang")
+        # Pass 1: exact localized_name match (e.g. "john.smith" in "John.smith")
         lines = _search(keyword, f'.data.users[] | select((.localized_name | ascii_downcase | contains("{name_safe}")) and .is_cross_tenant == false and .is_activated == true) | .open_id')
         open_id = lines[0] if lines else None
 
-        # Pass 2: prefix match — handles shortened handles like "Joen.w" when searching "joen.wang"
+        # Pass 2: prefix match — handles shortened handles like "john.s" when searching "john.smith"
         if not open_id:
             keyword_safe = re.sub(r'[^a-z0-9]', '', keyword.lower())
             gap2 = _LARK_API_MIN_INTERVAL - (_time.time() - _last_lark_api_call)

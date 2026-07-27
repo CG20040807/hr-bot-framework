@@ -50,9 +50,9 @@ Start directly with the answer. Never open with "根据知识库", "Based on the
    Bot has no org data. Direct to Lark profile or HRBP. Nothing else.
 
 5. Contact tags: output <<联系:lark.handle>> for each contact. The handle is the Lark username (Firstname.lastname format).
-   - If the KB shows a display name like "Nini (Nitz)" alongside an email like "ni.chen@lbank.com", use the email prefix as the handle: <<联系:ni.chen>>.
-   - If the KB only shows a Firstname.lastname Lark name (e.g., "Tommy.tang"), use that directly: <<联系:Tommy.tang>>.
-   - If the KB shows a lowercase handle like "kui.pan" or "jiang.y", use it as-is: <<联系:kui.pan>>.
+   - If the KB shows a display name like "Nini (Nitz)" alongside an email like "someone@example.com", use the email prefix as the handle: <<联系:someone>>.
+   - If the KB only shows a Firstname.lastname Lark name (e.g., "John.smith"), use that directly: <<联系:John.smith>>.
+   - If the KB shows a lowercase handle like "john.smith" or "jane.d", use it as-is: <<联系:john.smith>>.
    - Only use names from the retrieved KB context. Never invent a handle.
    - EVERY person mentioned MUST have a <<联系:handle>> tag — never output a name without it.
 
@@ -183,7 +183,7 @@ _BLOCKED_PATTERNS = [
     "黑幕","丑闻","负面新闻",
     # 公司声誉 / 法律敏感 — 英文
     "reported to authorities","under investigation","lawsuit against",
-    "going bankrupt","company scandal","bad news about lbank",
+    "going bankrupt","company scandal","bad news about mycompany",
     # Prompt 注入 — 中文
     # 注："假设你是"/"你现在是"/"你是一个新的"/"把你自己当" 不能裸词匹配——员工自然口语提问
     # 也会说"假设你是HR，陪产假怎么申请""你现在是不是没法查工资"（"是不是"疑问句式）。
@@ -245,7 +245,7 @@ _OFFTOPIC_PATTERNS = [
     # 员工问"这句免责声明是什么意思"会被误拦。改走下方 _is_investment_advice_request()。
     "基金推荐", "理财建议", "什么时候买入",
     # 竞品/交易所对比 — 中文
-    # 注：交易所名称/"和lbank"/"比lbank" 不再裸词匹配——员工可能提到"以前在okx工作"
+    # 注：交易所名称/"和mycompany"/"比mycompany" 不再裸词匹配——员工可能提到"以前在okx工作"
     # 这类正常入职背景问题，或句子里自然出现"和公司签合同"。改用 _is_exchange_comparison()
     # 判断：必须同时出现比较意图词，或同时提到 ≥2 个交易所名称，才算真的在做"交易所对比"。
     "哪个交易所",
@@ -257,9 +257,9 @@ _OFFTOPIC_PATTERNS = [
 ]
 
 # 交易所名称——单独出现（如"以前在okx工作过"）不算离题，只有明确带比较意图，
-# 或同时提到 ≥2 个交易所（含 lbank）时，才判定为"交易所对比"离题话题。
-_EXCHANGE_NAMES = ["okx", "binance", "bybit", "huobi", "coinbase", "欧易", "币安", "火币", "lbank",
-                   "vs lbank", "lbank vs", "better than lbank", "compared to lbank"]
+# 或同时提到 ≥2 个交易所（含自家名称）时，才判定为"交易所对比"离题话题。
+_EXCHANGE_NAMES = ["okx", "binance", "bybit", "huobi", "coinbase", "欧易", "币安", "火币", "mycompany",
+                   "vs mycompany", "mycompany vs", "better than mycompany", "compared to mycompany"]
 # 注："比"单独一个字不能放这里——会误命中"比如"（KB"金融产品和服务比如加密货币交易"），
 # 已有"对比"/"比较"覆盖真实比较意图，不需要再靠裸"比"字。
 _EXCHANGE_COMPARISON_WORDS = ["和", "与", "vs", "对比", "比较", "哪个", "哪家", "还是"]
@@ -268,8 +268,8 @@ _EXCHANGE_COMPARISON_WORDS = ["和", "与", "vs", "对比", "比较", "哪个", 
 def _is_exchange_comparison(query: str) -> bool:
     q = query.lower()
     hits = [name for name in _EXCHANGE_NAMES if name in q]
-    non_lbank_hits = [h for h in hits if h != "lbank"]
-    if not non_lbank_hits:
+    non_own_hits = [h for h in hits if h != "mycompany"]
+    if not non_own_hits:
         return False
     if len(hits) >= 2:
         return True
@@ -407,7 +407,7 @@ def _is_company_reputation_risk(query: str) -> bool:
 # "跑路"单独出现常是违纪/离职话题（"旷工跑路了""试用期跑路"），只有同时提到公司/老板/平台/
 # 交易所时才算在打听公司声誉。用共现判断而非紧邻词组，覆盖"公司是不是要跑路了"这类非紧邻表述。
 _RUNAWAY_TERM = "跑路"
-_RUNAWAY_TARGETS = ["公司", "老板", "平台", "交易所", "lbank", "l bank"]
+_RUNAWAY_TARGETS = ["公司", "老板", "平台", "交易所", "mycompany", "my company"]
 
 
 def _is_company_runaway(query: str) -> bool:
@@ -421,7 +421,7 @@ def _is_company_runaway(query: str) -> bool:
 # 钓鱼防范、金融欺诈防控条款），只有同时指向公司/平台本身、且不含培训/防范/条款类语境词时，
 # 才判定为"指控公司欺诈"的声誉风险问题。
 _FRAUD_TERMS = ["欺诈", "诈骗", "fraud", "scam"]
-_FRAUD_TARGETS = ["公司", "老板", "平台", "lbank", "l bank"]
+_FRAUD_TARGETS = ["公司", "老板", "平台", "mycompany", "my company"]
 _FRAUD_EXCLUDE = [
     "培训", "提醒", "防范", "防控", "规范", "制度", "条款", "规定", "政策", "案例",
     "training", "awareness", "prevention", "policy", "phishing",
