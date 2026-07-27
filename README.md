@@ -94,7 +94,7 @@ Configure in `config.py`: `SELF_CHECK_MODE = "fallback"`
 
 ```bash
 # 1. Install dependencies
-pip install lark-oapi openai numpy torch transformers sentencepiece
+pip install -r requirements.txt
 
 # 2. Configure (Lark app credentials / LLM gateway / admin open_id)
 cp config.example.py config.py && vi config.py

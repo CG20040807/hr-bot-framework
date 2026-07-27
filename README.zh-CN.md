@@ -94,7 +94,7 @@ flowchart LR
 
 ```bash
 # 1. 安装依赖
-pip install lark-oapi openai numpy torch transformers sentencepiece
+pip install -r requirements.txt
 
 # 2. 配置（飞书应用凭证 / LLM 网关 / 管理员 open_id）
 cp config.example.py config.py && vi config.py

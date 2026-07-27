@@ -94,7 +94,7 @@ weight(doc)  = W_min + (W_max − W_min) × credit  # ∈ [0.7, 1.3]
 
 ```bash
 # 1. 의존성 설치
-pip install lark-oapi openai numpy torch transformers sentencepiece
+pip install -r requirements.txt
 
 # 2. 설정 (Lark 앱 자격 증명 / LLM 게이트웨이 / 관리자 open_id)
 cp config.example.py config.py && vi config.py
