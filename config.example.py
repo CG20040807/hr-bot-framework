@@ -41,3 +41,16 @@ SELF_CHECK_MODE = _env.get("SELF_CHECK_MODE", "note")
 #   环境变量 HR_CREDIT_ENABLED=0 可关闭；
 #   上线前用 python3 eval_kb.py --compare 做离线 A/B 对照验证效果
 
+# 话题级权威链接白名单（可选）：当某些话题的关键词以样板文字形式散落在多个文档中，
+# 查询命中时只推这里配置的权威链接，抑制其他文档级链接。默认空列表 = 功能关闭。
+# 示例：
+# TOPIC_LINKS = [
+#     {
+#         "id": "speakup",
+#         "query": ("举报热线", "speakup", "speak up"),  # 查询含任一词即命中
+#         "label": "员工监督渠道",
+#         "url": "https://your-tenant.larksuite.com/wiki/xxx",
+#     },
+# ]
+TOPIC_LINKS = []
+
