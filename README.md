@@ -1,48 +1,154 @@
-# HR 问答 Bot（飞书）
+<div align="center">
 
-面向企业员工的 HR 智能问答机器人：基于 RAG 检索本地知识库，**原文转述**制度内容并推送来源链接，不让大模型自由发挥，从机制上杜绝幻觉。
+# 🏢 HR Q&A Bot for Lark
 
-## 核心特性
+**Enterprise-grade HR assistant — hallucination-free by design**
 
-- **原文转述 + 链接推送**：答案严格来自知识库原文，附来源文档链接，可溯源
-- **RAG 检索**：向量召回 + BGE Reranker 精排，按章节命中
-- **中英双语**：自动识别提问语言，双语知识库
-- **流式卡片回复**：飞书卡片边生成边更新，带 👍/👎 反馈按钮
-- **多轮上下文**：支持追问（"那这个呢"）
-- **自愈闭环**：答不出时静默记录 → 每日日报汇总高频/未解答问题 → 管理员确认后补充知识库
-- **生产级稳定性**：进程内重连 + 失败保险丝 + 外部看门狗，作息感知值守
+Answers are *verbatim transcriptions* from your knowledge base with source links.
+The LLM never improvises. Ever.
 
-## 快速开始
+[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Lark%20%2F%20Feishu-00D6B9?logo=slack&logoColor=white)](https://www.larksuite.com/)
+[![RAG](https://img.shields.io/badge/RAG-Hybrid%20Retrieval-8A2BE2)](#-architecture)
+[![Feedback Credit](https://img.shields.io/badge/Feature-Feedback%20Credit%20Weighting-FF6B6B)](#-feedback-credit-weighting)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+
+</div>
+
+---
+
+## ✨ Why This Bot Is Different
+
+Most RAG bots let the LLM *rewrite* retrieved content — and inherit its hallucinations.
+This bot is built on the opposite principle:
+
+> **The answer must be the original KB text, transcribed word-for-word, plus a source link. The model is a retrieval-and-formatting layer, never an author.**
+
+| Feature | Description |
+|---|---|
+| 📜 **Verbatim Answers** | Strict prompt contract + citation verification: every claim traceable to KB text |
+| 🏦 **Feedback Credit Weighting** | 👍/👎 feedback builds per-document credit scores that re-rank future retrieval — inspired by multi-agent trust scoring |
+| 🛡️ **Confidence Gate** | LLM self-check before sending; unverifiable answers are downgraded or withheld entirely |
+| ⚡ **Streaming Cards** | Lark interactive cards updated live as tokens generate, with feedback buttons |
+| 🌐 **Bilingual** | Auto language detection (中文 / English), bilingual KB support |
+| 🔄 **Self-Healing Loop** | Unanswered questions are logged → daily digest → admin confirms → KB improves |
+| 🩺 **Production-Grade Ops** | In-process reconnect, fail-safe fuse, schedule-aware watchdog (launchd) |
+| 📊 **Offline A/B Eval** | `eval_kb.py --compare` proves every change is non-regressing before shipping |
+
+---
+
+## 🏗 Architecture
+
+```mermaid
+flowchart LR
+    U[👤 Employee] -->|Lark message| B[bot.py]
+    B --> R[Hybrid Retrieval<br/>BM25 + Vector + HyDE + LLM rewrite]
+    R --> RR[BGE Reranker]
+    RR --> CW[🏦 Credit Weighting]
+    CW --> L[LLM · verbatim layer]
+    L --> SC{🛡️ Self-check gate}
+    SC -->|pass| C[⚡ Streaming card<br/>+ 👍/👎 buttons]
+    SC -->|fail| F[Fallback response]
+    C -->|feedback| CS[(Credit Store<br/>SQLite)]
+    CS -.->|re-rank weight| CW
+    B --> Q[(Question Log)]
+    Q --> D[📊 Daily digest<br/>top questions + unanswered]
+```
+
+---
+
+## 🏦 Feedback Credit Weighting
+
+Inspired by **trust scoring in multi-agent systems** (e.g. Manus), applied to the retrieval layer:
+
+```
+credit(doc)  = (👍 + α) / (👍 + 👎 + 2α)        # Bayesian smoothing, α = 2
+weight(doc)  = W_min + (W_max − W_min) × credit  # ∈ [0.7, 1.3]
+final_score  = reranker_score × weight(doc)
+```
+
+- New documents start **neutral** (credit 0.5 → weight 1.0) — no cold-start bias
+- Repeatedly down-voted sources sink; verified sources rise
+- **Ranking-only**: it never touches answer generation, so it cannot introduce hallucinations
+- Validate before enabling: `python3 eval_kb.py --compare` runs the full eval suite with credit ON vs OFF and prints the delta
+
+---
+
+## 🛡️ Confidence Gate
+
+Every generated answer is checked against the retrieved contexts by an LLM self-check.
+If claims cannot be traced to KB text, the gate degrades gracefully:
+
+| Mode | Behavior |
+|---|---|
+| `note` *(default)* | Send answer + append a verification disclaimer |
+| `fallback` | **Withhold the answer entirely** — reply with a cautious fallback instead |
+
+Configure in `config.py`: `SELF_CHECK_MODE = "fallback"`
+
+---
+
+## 🚀 Quick Start
 
 ```bash
-# 1. 安装依赖
+# 1. Install dependencies
 pip install lark-oapi openai numpy torch transformers sentencepiece
 
-# 2. 配置（填入飞书应用凭证 / LLM 网关 / 管理员 open_id）
+# 2. Configure (Lark app credentials / LLM gateway / admin open_id)
 cp config.example.py config.py && vi config.py
 
-# 3. 放入知识库（.md 文件，每个文件一个主题）
-cp 你的制度文档.md kb/
+# 3. Drop your policy docs into the knowledge base
+cp your-policy.md kb/
 
-# 4. 启动
+# 4. Run
 python3 bot.py
 ```
 
-## 目录结构
+Optional — auto-sync KB from Lark wiki: `cp sync_sources.example.json sync_sources.json`, fill in doc URLs, then `python3 lark_sync.py`.
 
-| 文件 | 职责 |
+---
+
+## 📁 Project Structure
+
+| File | Role |
 |---|---|
-| `bot.py` | 主程序：飞书 WS 长连接、消息分发、卡片 UI、重连与值守 |
-| `llm.py` | LLM 调用：Prompt 约束、守卫、流式生成、置信自查 |
-| `kb.py` / `index_manager.py` / `vector_store.py` / `reranker.py` | 知识库索引与检索链路 |
-| `question_log.py` | 问题记录（sqlite）、每日日报、反馈收集 |
-| `kb_healer.py` | 知识库自愈建议（管理员确认制） |
-| `lark_sync.py` | 从飞书 wiki/docx 自动同步知识库内容 |
-| `eval_kb.py` | 离线评测：用例集跑准确率，改动前先验证不回归 |
-| `watchdog.sh` | 外部看门狗（launchd 定时调用，作息感知） |
+| `bot.py` | Main app: Lark WebSocket, message dispatch, card UI, reconnect & watchdog logic |
+| `llm.py` | LLM layer: prompt contract, guards, streaming, self-check |
+| `credit_store.py` | 🏦 Feedback credit weighting (SQLite) |
+| `kb.py` · `index_manager.py` · `vector_store.py` · `reranker.py` | Hybrid retrieval pipeline |
+| `question_log.py` | Question logging, feedback, daily digest |
+| `kb_healer.py` | KB self-healing suggestions (admin-confirmed) |
+| `lark_sync.py` | Auto-sync KB from Lark wiki/docx |
+| `eval_kb.py` | Offline eval: LLM-as-judge grading + A/B compare |
+| `watchdog.sh` | Schedule-aware external watchdog for launchd |
 
-## 运维
+---
 
-- `launchd` 保活（KeepAlive），`watchdog.sh` 每分钟巡检（仅工作日白天）
-- 管理员在飞书对 bot 说：`重载知识库` / `同步知识库`
-- 改代码前先跑 `python3 eval_kb.py` 确认评测不回归
+## 📊 Evaluation
+
+```bash
+python3 eval_kb.py              # full suite: faithfulness / completeness / link accuracy
+python3 eval_kb.py --compare    # A/B: credit weighting OFF vs ON
+python3 eval_kb.py --files 假期政策.md --limit 20   # quick debug run
+```
+
+Grading is done by LLM-as-judge across three axes: **faithfulness** (no claims beyond KB),
+**completeness** (no missing key facts), **link accuracy** (correct source document).
+
+---
+
+## 🔧 Operations
+
+- `launchd` KeepAlive + `watchdog.sh` (work-hours aware)
+- Admin commands in Lark DM: `重载知识库` / `同步知识库`
+- Every change is gated by `eval_kb.py` — no regression ships
+
+---
+
+<div align="center">
+
+**License:** MIT · Built with ❤️ for HR teams
+
+</div>

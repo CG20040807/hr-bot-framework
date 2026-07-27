@@ -341,6 +341,36 @@ def report(grades: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fail_counts(grades: list[dict]) -> tuple:
+    f = sum(1 for g in grades if g.get("faithfulness", {}).get("faithful") is False)
+    c = sum(1 for g in grades if g.get("completeness", {}).get("complete") is False)
+    l = sum(1 for g in grades if g.get("link_ok") is False)
+    return f, c, l
+
+
+def _compare_report(baseline: list[dict], weighted: list[dict]) -> str:
+    """信用加权 A/B 对照：off（基线）vs on（加权），失败数越少越好。"""
+    n = len(baseline)
+    bf, bc, bl = _fail_counts(baseline)
+    wf, wc, wl = _fail_counts(weighted)
+
+    def _delta(b, w):
+        d = b - w  # 正数 = 加权版失败更少 = 改善
+        return f"改善 {-d:+d}" if d > 0 else (f"退化 {-d:+d}" if d < 0 else "持平")
+
+    lines = [
+        "=" * 60,
+        f"A/B 对照报告 — 信用加权 off vs on（{n} 题，失败数越少越好）",
+        "=" * 60,
+        f"  Faithfulness 失败:  off={bf}  on={wf}   {_delta(bf, wf)}",
+        f"  Completeness 失败:  off={bc}  on={wc}   {_delta(bc, wc)}",
+        f"  Link 不匹配:        off={bl}  on={wl}   {_delta(bl, wl)}",
+        "",
+        "详细评分明细: grades-off.json / grades-on.json",
+    ]
+    return "\n".join(lines)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Main
 # ════════════════════════════════════════════════════════════════════════════════
@@ -350,6 +380,10 @@ def main():
     parser.add_argument("--files", nargs="*", help="Only eval these KB files")
     parser.add_argument("--limit", type=int, help="Max sections to process (debug)")
     parser.add_argument("--phase", type=int, default=1, help="Start from phase N (1/2/3)")
+    parser.add_argument("--credit", choices=["on", "off"], default="on",
+                        help="信用加权开关（单跑模式，默认 on）")
+    parser.add_argument("--compare", action="store_true",
+                        help="A/B 对照：信用加权 off / on 各跑一遍 Phase 2+3，输出对比报告")
     args = parser.parse_args()
 
     cases_f  = OUT_DIR / "cases.json"
@@ -382,6 +416,27 @@ def main():
     else:
         cases = json.loads(cases_f.read_text())
         print(f"[Phase 1 跳过] 加载 {len(cases)} 个已有测例")
+
+    # ── A/B 对照模式：信用加权 off / on 各跑一遍 Phase 2+3 ────────────────────
+    if args.compare:
+        import credit_store
+        arms = {}
+        for arm in ("off", "on"):
+            credit_store.ENABLED = (arm == "on")
+            print(f"\n[Phase 2 · credit={arm}] 运行 bot 回答 {len(cases)} 题...")
+            runs_arm = run_bot(cases)
+            grades_arm = grade_all(runs_arm)
+            arms[arm] = grades_arm
+            (OUT_DIR / f"grades-{arm}.json").write_text(
+                json.dumps(grades_arm, ensure_ascii=False, indent=2))
+        txt = _compare_report(arms["off"], arms["on"])
+        (OUT_DIR / "compare-report.txt").write_text(txt)
+        print(f"\n{txt}")
+        return
+
+    # 单跑模式：按 --credit 设置信用加权开关
+    import credit_store
+    credit_store.ENABLED = (args.credit == "on")
 
     # ── Phase 2: run bot ──────────────────────────────────────────────────────
     if args.phase <= 2:

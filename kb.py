@@ -373,6 +373,12 @@ def search(query: str, top_k: int = 6, min_score: int = 1,
     except Exception:
         scored = [(None, c) for c in candidates]
 
+    # 信用加权：用户 👍/👎 反馈累计的文档信用分作为乘性权重作用于 reranker 分数，
+    # 被踩过的来源自动降权（见 credit_store.py；只影响排序，不改动答案生成）
+    import credit_store as _cs
+    if _cs.enabled():
+        scored = _cs.apply(scored)
+
     # Lost-in-the-Middle 修复：最高分置首，次高分置尾，LLM 对首尾注意力最强
     # （分数随 chunk 一起重排，供链接推送按相关性分级使用）
     scored = _reorder_lost_in_middle(scored[:top_k])

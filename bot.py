@@ -65,8 +65,10 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 _socket.getaddrinfo = _patched_getaddrinfo
 
+import config as _config
 from config import APP_ID, APP_SECRET, ADMIN_OPEN_ID
 from kb import search, has_intent
+import credit_store
 from llm import answer, answer_stream, is_guard_query, strip_preamble, strip_article_citations, needs_clarification, clarify, _detect_lang, self_check
 import question_log
 
@@ -540,9 +542,12 @@ _CARD_STORE_TTL = 7200  # 2 小时
 
 
 def _card_store_put(qid: str, question: str, answer_text: str,
-                    chat_id: str = "", lang: str = "zh") -> None:
-    _card_store[qid] = (question, answer_text, _time.time(), chat_id, lang)
-    expired = [k for k, (_, _, ts, _, _) in _card_store.items()
+                    chat_id: str = "", lang: str = "zh",
+                    contexts: Optional[list] = None) -> None:
+    # contexts 一并存档：用户点 👍/👎 时把反馈归因到当次引用的来源文档（信用加权）
+    docs = [credit_store.doc_of(c) for c in (contexts or [])]
+    _card_store[qid] = (question, answer_text, _time.time(), chat_id, lang, docs)
+    expired = [k for k, (_, _, ts, _, _, _) in _card_store.items()
                if _time.time() - ts > _CARD_STORE_TTL]
     for k in expired:
         del _card_store[k]
@@ -551,10 +556,10 @@ def _card_store_put(qid: str, question: str, answer_text: str,
 def _card_store_pop(qid: str) -> Optional[tuple]:
     entry = _card_store.get(qid)
     if entry:
-        q, a, ts, chat_id, lang = entry
+        q, a, ts, chat_id, lang, docs = entry
         del _card_store[qid]
         if _time.time() - ts < _CARD_STORE_TTL:
-            return q, a, chat_id, lang
+            return q, a, chat_id, lang, docs
     return None
 
 
@@ -877,6 +882,28 @@ def _build_streaming_card(text: str, cursor: bool = True) -> dict:
     }
 
 
+
+def _apply_confidence_gate(reply_text: str, contexts: list, lang: str) -> str:
+    """置信度门控：self_check 判定答案无法完全追溯 KB 原文时按配置降级。
+
+    模式（config.SELF_CHECK_MODE）：
+      note（默认）——保留答案，追加免责提示；
+      fallback    ——整段替换为保守兜底话术，存疑内容宁可不发（防幻觉最严档）。"""
+    if not contexts or self_check(reply_text, contexts):
+        return reply_text
+    mode = getattr(_config, "SELF_CHECK_MODE", "note")
+    log.info("[self-check] FAIL — 置信度门控触发（模式 %s）", mode)
+    if mode == "fallback":
+        return ("I'm not fully confident this answer matches the knowledge base, "
+                "so I'd rather not guess — please check with the HR team."
+                if lang == "en"
+                else "这个答案我没有十足把握对应知识库原文，为避免误导就不猜了，"
+                     "建议直接咨询 HR 团队确认。")
+    note = ("\n\n⚠️ Note: Some details may not be directly in the knowledge base — please verify with the HR team."
+            if lang == "en"
+            else "\n\n⚠️ 注意：以上部分内容未能完全对应知识库原文，请以实际政策文件或 HR 团队确认为准。")
+    return reply_text + note
+
 def _stream_reply(query: str, contexts: list, history: list, lang: str,
                   chat_id: str, sender_id: str, t_start: float, t_kb: float,
                   scores: list = None) -> None:
@@ -889,18 +916,14 @@ def _stream_reply(query: str, contexts: list, history: list, lang: str,
         # 初始卡片发送失败 → 降级同步流程（同样执行 self_check + grounding_check）
         raw = answer(query, contexts, history=history)
         reply_text = _strip_markdown(strip_article_citations(strip_preamble(raw)))
-        if contexts and not self_check(reply_text, contexts):
-            note = ("\n\n⚠️ Note: Some details may not be directly in the knowledge base — please verify with the HR team."
-                    if lang == "en"
-                    else "\n\n⚠️ 注意：以上部分内容未能完全对应知识库原文，请以实际政策文件或 HR 团队确认为准。")
-            reply_text += note
+        reply_text = _apply_confidence_gate(reply_text, contexts, lang)
         if contexts:
             reply_text = _grounding_check(reply_text, contexts)
         # reply 确定后才决定推哪些链接（内容从哪来就推哪里）
         links = _curate_links(contexts, query, scores=scores, reply=reply_text) if contexts and not is_guard_query(query) else []
         reply_text = _finalize_links(reply_text, links, lang, query)
         display = _resolve_mentions_for_card(reply_text)
-        _card_store_put(qid, query, display, chat_id, lang)
+        _card_store_put(qid, query, display, chat_id, lang, contexts)
         _send_interactive(_build_answer_card(display, qid, lang), chat_id)
         # _cache_put 已关闭
         question_log.log_question(query, len(contexts), reply_text)
@@ -926,12 +949,7 @@ def _stream_reply(query: str, contexts: list, history: list, lang: str,
     reply_text = _strip_markdown(strip_article_citations(strip_preamble(buffer)))
     # Self-check 必须先于 grounding_check 运行——grounding_check 会在数字后插入括号注释，
     # 若 self_check 拿到修改后的文本则会找不到原字面量，导致误 FAIL
-    if contexts and not self_check(reply_text, contexts):
-        note = ("\n\n⚠️ Note: Some details may not be directly in the knowledge base — please verify with the HR team."
-                if lang == "en"
-                else "\n\n⚠️ 注意：以上部分内容未能完全对应知识库原文，请以实际政策文件或 HR 团队确认为准。")
-        reply_text += note
-        log.info("[self-check] FAIL — 已追加免责提示")
+    reply_text = _apply_confidence_gate(reply_text, contexts, lang)
     if contexts:
         reply_text = _grounding_check(reply_text, contexts)
     # reply 确定后才决定推哪些链接（内容从哪来就推哪里）
@@ -942,7 +960,7 @@ def _stream_reply(query: str, contexts: list, history: list, lang: str,
     log.info("[PERF] total=%.2fs kb=%.2fs llm=%.2fs chars=%d", t_total, t_kb, t_llm, len(reply_text))
 
     display_text = _resolve_mentions_for_card(reply_text)
-    _card_store_put(qid, query, display_text, chat_id, lang)
+    _card_store_put(qid, query, display_text, chat_id, lang, contexts)
 
     ok = _patch_card(msg_id, _build_answer_card(display_text, qid, lang))
     if not ok:
@@ -1030,7 +1048,7 @@ def _heal_and_resend(chat_id: str, query: str, lang: str) -> None:
         new_reply = _finalize_links(new_reply, links, lang, query)
         display = _resolve_mentions_for_card(new_reply)
         new_qid = str(uuid.uuid4())
-        _card_store_put(new_qid, query, display, chat_id, lang)
+        _card_store_put(new_qid, query, display, chat_id, lang, contexts)
         _send_interactive(_build_healed_card(display, new_qid, lang), chat_id)
         log.info("[healer] 自愈成功，已发改进回答")
     except Exception as e:
@@ -1055,6 +1073,13 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         answer_text = stored[1] if stored else ""
         chat_id_stored = stored[2] if stored else ""
         lang_stored    = stored[3] if stored else "zh"
+        source_docs    = stored[4] if stored else []
+
+        # 信用归因：👍/👎 映射为布尔后累计到来源文档（satisfied/still_not_helpful 同理）
+        _credit_map = {"helpful": True, "not_helpful": False,
+                       "satisfied": True, "still_not_helpful": False}
+        if action in _credit_map and source_docs:
+            credit_store.record_feedback(source_docs, _credit_map[action])
 
         question_log.log_feedback(action, question, answer_text[:200])
 

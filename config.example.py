@@ -29,3 +29,15 @@ DOCS_DIR    = PROJECT_DIR / "docs"
 
 # 知识库目录：把制度文档的 .md 文件放进去即可
 KB_DIR = PROJECT_DIR / "kb"
+
+# ── 增强特性 ──────────────────────────────────────────────────────────────
+
+# 置信度门控：LLM 自查判定答案无法完全追溯 KB 原文时的降级策略
+#   "note"     —— 保留答案，追加免责提示（默认，温和）
+#   "fallback" —— 整段替换为兜底话术，存疑内容宁可不发（最严防幻觉档）
+SELF_CHECK_MODE = _env.get("SELF_CHECK_MODE", "note")
+
+# 反馈信用加权（credit_store.py）：👍/👎 反馈累计为文档信用分并参与检索排序
+#   环境变量 HR_CREDIT_ENABLED=0 可关闭；
+#   上线前用 python3 eval_kb.py --compare 做离线 A/B 对照验证效果
+
