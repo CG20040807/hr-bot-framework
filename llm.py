@@ -135,16 +135,13 @@ def strip_preamble(text: str) -> str:
 _BLOCKED_PATTERNS = [
     # 政治敏感 — 中文
     # 注："政府"和"台湾"不能裸词匹配——KB 里"按政府规定享受计划生育假期""员工必须遵守政府的
-    # 各项法律"（制度手册）、"中国台湾地区"（差旅费/海外补贴的国家分类）、"商务经理（台湾）"
-    # （真实招聘岗位）都合法用到这两个词。改成只在明确政治意图（统一/独立/两岸等）下才拦截，
+    # 各项法律"（制度手册）、"中国台湾地区"（差旅费/海外补贴的国家分类）都合法用到这两个词。
+    # 改成只在明确政治意图（统一/独立/两岸等）下才拦截，
     # 见下方 _is_political_sensitive()；不含政治意图词的"台湾"/"政府"不在此裸词列表拦截。
-    # 注："选举"也不能裸词匹配——KB 交易所培训文档讲 DPoS 共识机制时写"由代币持有者投票选举出
-    # 少数节点进行记账"，这是区块链术语不是政治话题。改走下方 _is_election_political()：
-    # 命中区块链/共识类语境词时不拦截。
-    # 注："外交"也不能裸词匹配——KB 里"对外交往"（工作纪律用语）、"国内外交通标准"（差旅报销）、
-    # "场外交易(OTC)"（交易所培训）都会被"外交"子串误命中。改走下方 _is_diplomacy_related()：
+    # 注："外交"也不能裸词匹配——KB 里"对外交往"（工作纪律用语）、"国内外交通标准"（差旅报销）
+    # 都会被"外交"子串误命中。改走下方 _is_diplomacy_related()：
     # 排除"外交"紧跟"往/通/易"的这三种合法搭配。
-    "政治","战争","制裁","新疆","西藏",
+    "政治","战争","制裁","选举","新疆","西藏",
     "中美","中日","中欧","地缘","领土","主权",
     "两岸","台独","港独","藏独","一国两制",
     # 政治敏感 — 英文（补齐中文已有的）
@@ -200,8 +197,8 @@ _BLOCKED_PATTERNS = [
     # 越权数据请求 — 中文
     "列出所有员工","导出员工名单","所有人的工资","全部员工信息",
     # 越权数据请求 — 英文（补齐）
-    # 注："dump"单独裸词移出——KB 交易培训文档把"砸盘"英文注释为"Dump"，"什么是砸盘dump"
-    # 这类合法问题会被误拦。改用 _is_data_dump_request()：只在和员工/数据类词共现时才拦截。
+    # 注："dump"单独裸词移出——"dump 日志/文件"是常见技术用语，改用 _is_data_dump_request()：
+    # 只在和员工/数据类词共现时才拦截。
     # "all employee"也移出裸词列表——KB 大量出现"all employees are required to..."
     # "applies to all employees"这类正常制度描述句，改用 _is_all_employee_data_request()：
     # 只在同时出现数据/工资/名单/导出类词时才判定为越权取数请求。
@@ -236,44 +233,22 @@ _OFFTOPIC_PATTERNS = [
     "recommend a movie", "good movies to watch", "recommend a game",
     "stock price", "crypto price", "bitcoin price",
     # 金融市场/行情 — 中文（非HR职责）
-    # 注："技术分析"删除——KB 里"交易所培训/信息安全事件定级"文档本身就用这个词，
+    # 金融市场/行情 — 中文（非HR职责）
+    # 注："技术分析"删除——KB 里的培训/安全事件文档本身可能用这个词，
     # 裸词匹配会把正常的内部培训/安全事件问题也拦截掉。改由更具体的词覆盖同类意图。
     "黄金走势", "行情分析", "涨跌分析", "k线", "均线",
     "炒股", "股票推荐", "买什么股", "哪只股",
     "股票今天", "股票涨了", "股票跌了", "今天涨了", "今天跌了",
-    # 注："投资建议"移出裸词列表——KB 交易所培训文档结尾常有"不构成任何投资建议"的免责声明，
+    # 注："投资建议"移出裸词列表——KB 文档结尾常有"不构成任何投资建议"的免责声明，
     # 员工问"这句免责声明是什么意思"会被误拦。改走下方 _is_investment_advice_request()。
     "基金推荐", "理财建议", "什么时候买入",
-    # 竞品/交易所对比 — 中文
-    # 注：交易所名称/"和mycompany"/"比mycompany" 不再裸词匹配——员工可能提到"以前在okx工作"
-    # 这类正常入职背景问题，或句子里自然出现"和公司签合同"。改用 _is_exchange_comparison()
-    # 判断：必须同时出现比较意图词，或同时提到 ≥2 个交易所名称，才算真的在做"交易所对比"。
-    "哪个交易所",
+    # 竞品对比 — 中文
     "竞争对手", "竞品信息", "帮我查对手", "查一下竞争",
     # 金融市场/行情 — 英文
     "gold price", "oil price", "forex rate", "exchange rate",
     "market analysis", "trade signal",
     "buy the dip", "when to buy", "investment advice",
 ]
-
-# 交易所名称——单独出现（如"以前在okx工作过"）不算离题，只有明确带比较意图，
-# 或同时提到 ≥2 个交易所（含自家名称）时，才判定为"交易所对比"离题话题。
-_EXCHANGE_NAMES = ["okx", "binance", "bybit", "huobi", "coinbase", "欧易", "币安", "火币", "mycompany",
-                   "vs mycompany", "mycompany vs", "better than mycompany", "compared to mycompany"]
-# 注："比"单独一个字不能放这里——会误命中"比如"（KB"金融产品和服务比如加密货币交易"），
-# 已有"对比"/"比较"覆盖真实比较意图，不需要再靠裸"比"字。
-_EXCHANGE_COMPARISON_WORDS = ["和", "与", "vs", "对比", "比较", "哪个", "哪家", "还是"]
-
-
-def _is_exchange_comparison(query: str) -> bool:
-    q = query.lower()
-    hits = [name for name in _EXCHANGE_NAMES if name in q]
-    non_own_hits = [h for h in hits if h != "mycompany"]
-    if not non_own_hits:
-        return False
-    if len(hits) >= 2:
-        return True
-    return any(w in q for w in _EXCHANGE_COMPARISON_WORDS)
 
 # 带通配符的 offtopic 模式（simple string `in` 无法表达，改用 regex）
 # 注：字符类里不能放裸的"金"——"五险一金""公积金""奖金"等正常 HR 词都以"金"结尾，
@@ -286,7 +261,7 @@ _OFFTOPIC_REGEXES = [
 ]
 
 
-# "投资建议"单独出现常是 KB 交易所培训文档里的免责声明原文（"不构成任何投资建议"），
+# "投资建议"单独出现常是 KB 文档里的免责声明原文（"不构成任何投资建议"），
 # 员工问免责声明是什么意思、或摘录/引用该句时不应拦截，只有在真的向 bot 索要投资建议
 # （不含免责声明/风险提示类语境词）时才拦截。
 _INVESTMENT_ADVICE_TERM = "投资建议"
@@ -352,21 +327,8 @@ def _is_political_sensitive(query: str) -> bool:
     return any(w in q for w in _POLITICAL_CONTEXT_WORDS)
 
 
-# "选举"单独出现有非政治含义——KB 交易所培训文档讲 DPoS 共识机制时写"由代币持有者投票
-# 选举出少数节点进行记账"，只有不含区块链/共识类语境词时，才判定为政治选举话题。
-_ELECTION_TERM = "选举"
-_ELECTION_EXCLUDE = ["dpos", "pos", "pow", "节点", "代币", "共识", "区块链", "记账", "eos", "tron", "委托权益证明"]
-
-
-def _is_election_political(query: str) -> bool:
-    q = query.lower()
-    if _ELECTION_TERM not in q:
-        return False
-    return not any(e in q for e in _ELECTION_EXCLUDE)
-
-
-# "外交"作为子串会误命中"对外交往"（工作纪律用语）、"国内外交通标准"（差旅报销）、
-# "场外交易(OTC)"（交易所培训）——这三种合法搭配都是"外交"紧跟"往/通/易"，
+# "外交"作为子串会误命中"对外交往"（工作纪律用语）、"国内外交通标准"（差旅报销）
+# ——这三种合法搭配都是"外交"紧跟"往/通/易"，
 # 用负向前瞻排除这三个后缀字符，其余"外交XX"（外交政策/外交关系/中美外交等）正常拦截。
 _DIPLOMACY_RE = re.compile(r'外交(?!往|通|易)')
 
@@ -404,10 +366,10 @@ def _is_company_reputation_risk(query: str) -> bool:
     return not any(e in q for e in _COMPANY_REPUTATION_EXCLUDE)
 
 
-# "跑路"单独出现常是违纪/离职话题（"旷工跑路了""试用期跑路"），只有同时提到公司/老板/平台/
-# 交易所时才算在打听公司声誉。用共现判断而非紧邻词组，覆盖"公司是不是要跑路了"这类非紧邻表述。
+# "跑路"单独出现常是违纪/离职话题（"旷工跑路了""试用期跑路"），只有同时提到公司/老板/平台
+# 时才算在打听公司声誉。用共现判断而非紧邻词组，覆盖"公司是不是要跑路了"这类非紧邻表述。
 _RUNAWAY_TERM = "跑路"
-_RUNAWAY_TARGETS = ["公司", "老板", "平台", "交易所", "mycompany", "my company"]
+_RUNAWAY_TARGETS = ["公司", "老板", "平台", "mycompany", "my company"]
 
 
 def _is_company_runaway(query: str) -> bool:
@@ -449,7 +411,7 @@ def _is_war_related(query: str) -> bool:
     return bool(_WAR_WORD_RE.search(query))
 
 
-# "dump"单独出现有交易术语含义（KB 把"砸盘"注释为"Dump"），只有和员工/数据类词共现、
+# "dump"单独出现可能是日常技术用语（如"dump 日志"），只有和员工/数据类词共现、
 # 明确指向越权导出员工数据时才拦截。
 _DUMP_TERM = "dump"
 _DUMP_DATA_CONTEXT = ["员工", "employee", "数据", "data", "工资", "salary", "名单", "信息", "database", "table"]
@@ -531,7 +493,6 @@ def _is_blocked(query: str) -> bool:
             or _is_data_dump_request(q)
             or _is_act_as_injection(q)
             or _is_all_employee_data_request(q)
-            or _is_election_political(q)
             or _is_diplomacy_related(q)
             or _is_roleplay_injection(q))
 
@@ -540,7 +501,6 @@ def _is_offtopic(query: str) -> bool:
     q = query.lower()
     return (any(p in q for p in _OFFTOPIC_PATTERNS)
             or any(rx.search(query) for rx in _OFFTOPIC_REGEXES)
-            or _is_exchange_comparison(query)
             or _is_investment_advice_request(q))
 
 
@@ -549,28 +509,6 @@ def _is_maternity(query: str) -> bool:
     if any(e in q for e in _MATERNITY_EXCLUDE):
         return False
     return any(p in q for p in _MATERNITY_PATTERNS) or bool(_POSTPARTUM_RE.search(q))
-
-
-# 陪产假标准回复（2026-07-20 用户提供，指定"以后一律这样答，不要用KB原文"）。
-# 硬编码为固定话术，绕开 KB 检索+LLM 转述，避免：1) 措辞随 KB 同步/LLM 生成漂移；
-# 2) 员工制度手册被 lark_sync.py 自动同步覆盖时，答案跟着变回旧版本。
-_PATERNITY_QA_PATTERNS = ["陪产假", "paternity leave"]
-
-_PATERNITY_ANSWER_ZH = (
-    "符合国家计划生育政策的男员工，享受陪产假10天，需提交结婚证和医学生育证明；"
-    "不符合国家计划生育政策的，男员工不享有陪产假待遇。"
-)
-
-_PATERNITY_ANSWER_EN = (
-    "Male employees who comply with the national family planning policy are entitled to "
-    "10 days of paternity leave (marriage certificate and medical birth certificate required); "
-    "employees who do not comply with the policy are not entitled to paternity leave."
-)
-
-
-def _is_paternity_leave(query: str) -> bool:
-    q = query.lower()
-    return any(p in q for p in _PATERNITY_QA_PATTERNS)
 
 
 def _detect_lang(text: str) -> str:
@@ -583,8 +521,6 @@ def _detect_lang(text: str) -> str:
 
 def _guard_response(query: str, lang: str) -> Optional[str]:
     """Returns a canned reply if query hits a guard rule, else None."""
-    if _is_paternity_leave(query):
-        return _PATERNITY_ANSWER_EN if lang == "en" else _PATERNITY_ANSWER_ZH
     if _is_blocked(query):
         return ("This is outside the scope of HR assistance."
                 if lang == "en"
@@ -650,7 +586,7 @@ def answer(query: str, context_sections: list[str],
 
 def is_guard_query(query: str) -> bool:
     """Guard 场景（blocked/offtopic/maternity/paternity 硬编码答案）时返回 True，不应追加 KB 链接。"""
-    return _is_blocked(query) or _is_offtopic(query) or _is_maternity(query) or _is_paternity_leave(query)
+    return _is_blocked(query) or _is_offtopic(query) or _is_maternity(query)
 
 
 def answer_stream(query: str, context_sections: list, history: Optional[list] = None):

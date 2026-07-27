@@ -469,14 +469,12 @@ def _compute_idf(files_index: dict) -> dict:
 
 
 # 纯索引/链接汇总文件——不参与主内容竞争，单独作为文档链接补充
-_INDEX_FILES = frozenset(["HR资源库与文档索引.md", "交易所基础培训知识库索引.md"])
+# 按需替换为你自己 KB 里的索引类文件名
+_INDEX_FILES = frozenset(["HR资源库与文档索引.md"])
 
 # 低优先级文件——非政策/制度类，仅在主内容不足时作为兜底
-# 包括：产品培训文档、运营协议类文档（它们可能命中 HR 关键词但不提供 HR 政策答案）
+# 包括：培训文档、运营协议类文档（它们可能命中 HR 关键词但不提供 HR 政策答案）
 _TRAINING_FILES = frozenset([
-    "MCN主播培训文档.md",
-    "交易所MCN培训_核心必修.md",
-    "交易所MCN培训_进阶速查.md",
     "远程办公通讯响应规范.md",   # 通讯协议文档，非假期/薪资政策
 ])
 
@@ -487,7 +485,7 @@ _CONTACT_SIGNALS = frozenset([
     "who", "contact", "email", "reach",
     # 直接说部门缩写 → 意图就是"找联系人"
     "hr", "it", "ssc", "hrbp",
-    # 财务/报销类问题 → 注入 Finance 联系人（Allen.ren）
+    # 财务/报销类问题 → 注入 Finance 联系人
     "报销", "财务", "发票", "付款", "reimburs", "invoice", "payment",
 ])
 

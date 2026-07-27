@@ -44,16 +44,12 @@ OUT_DIR.mkdir(exist_ok=True)
 # ── 过滤规则：跳过无实质内容的 section ────────────────────────────────────────
 _SKIP_FILES = {
     "HR资源库与文档索引.md",
-    "交易所基础培训知识库索引.md",
     "员工制度手册索引.md",
     "培训课程库.md",
     "内推岗位汇总.md",
     "部门联系人.md",
     "员工活动系列1.md",
     "员工活动系列2.md",
-    "MCN主播培训文档.md",
-    "交易所MCN培训_核心必修.md",
-    "交易所MCN培训_进阶速查.md",
     "New Joiner Online Training Guide.md",
 }
 MIN_CONTENT_LEN = 80   # 内容太短（纯标题/导航）跳过
