@@ -1,0 +1,17 @@
+{
+  "kb_files": [
+    {
+      "local_file": "示例-假期政策.md",
+      "sources": [
+        {
+          "url": "https://your-tenant.larksuite.com/wiki/填入文档token",
+          "doc_type": "wiki",
+          "lang": "bilingual",
+          "revision_id": null,
+          "section_marker": null,
+          "notes": "来源说明，随意填写"
+        }
+      ]
+    }
+  ]
+}

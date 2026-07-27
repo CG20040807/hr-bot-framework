@@ -1,0 +1,13 @@
+# 本地运行中生成 / 含机密信息，一律不上传
+config.py
+kb/*.md
+!kb/README.md
+docs/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+.sync_state.json
+sync_sources.json
+kb_url_map.json
+*.db
