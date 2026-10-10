@@ -28,6 +28,17 @@ STATE="/tmp/hr-bot-watchdog.state"
 LABEL="com.yourcompany.hr-bot"  # 与 launchd plist 文件名保持一致
 COOLDOWN_SEC=1800     # 重启冷却期：30 分钟内不重复重启（避免飞书 429 限流）
 CONSEC_THRESHOLD=4    # 连续 4 次（约 20 分钟）判定无连接才动手
+RESTART_FLAG="/tmp/hr-bot-restart-flag"
+
+# 信号文件重启：写入 /tmp/hr-bot-restart-flag 后，watchdog 下次执行时
+# 无条件重启 bot 并删除信号文件（用于代码更新后远程触发重启）
+if [ -f "$RESTART_FLAG" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] 信号文件存在，强制重启 bot" >> "$LOG"
+    rm -f "$RESTART_FLAG"
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+    echo "$(date +%s) 0" > "$STATE"
+    exit 0
+fi
 
 now=$(date +%s)
 last_kickstart=0

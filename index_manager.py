@@ -15,6 +15,7 @@ import re
 import datetime
 import tempfile
 import os
+import threading
 from collections import defaultdict
 from pathlib import Path
 
@@ -122,6 +123,8 @@ _CN_SYNONYMS = {
     # 薪酬类互通（工资/薪酬/薪资 跨词匹配）
     "薪酬":["salary","payroll","工资","薪资"],
     "工资":["salary","payroll","薪酬","薪资"],
+    # 时长问法："X时间"（试用期时间/婚假时间）→ 命中"多久"类问答
+    "时间": ["多久"],
     # 3字 HR 高频词（trigram 级别）
     "年终奖":["bonus","奖金","绩效奖"],"年终":["bonus","奖金"],
     "绩效奖":["bonus","奖金","年终奖"],"试用期":["probation","转正","试用"],
@@ -137,7 +140,7 @@ _SYNONYMS = {
     "maternity":["产假"],"paternity":["陪产假"],"parental":["产假","陪产假"],
     "probation":["试用期","试用"],"confirm":["转正"],"confirmation":["转正"],
     "regulariz":["转正"],"salary":["薪资","工资","薪酬"],
-    "payroll":["薪资","工资"],"payday":["薪资","工资","15日"],
+    "payroll":["薪资","工资"],"payday":["薪资","工资"],
     "pay":["薪资","工资"],"paycheck":["薪资","工资"],
     "bonus":["奖金","绩效奖"],"performance":["绩效","考核"],
     "review":["绩效","考核"],"kpi":["绩效","考核"],
@@ -269,8 +272,95 @@ def _load_raw() -> dict:
 _MAX_SECTION_CHARS = 1600  # 单个 section 超过此长度则按段落继续拆分
 
 
+_QA_QLINE = re.compile(r'^Q[:：]')
+
+
+def _split_qa_pairs(content: str) -> list[str]:
+    """Q&A 章节按问答对拆成独立 chunk：每个 "Q:…A:…" 对带上标题上下文单独成块。
+
+    解决：十几个问答塞在一个 ~1550 字 chunk 里时，单个问答的关键词信号被稀释，
+    短查询（如"试用期时间"）排不进 top-k。按对拆分后每块信号精准。
+    非 Q&A 结构（Q 行 <2 个）返回空列表，调用方走原段落切分。"""
+    lines = content.splitlines()
+    q_idx = [i for i, l in enumerate(lines) if _QA_QLINE.match(l)]
+    if len(q_idx) < 2:
+        return []
+
+    header_lines, body_start = [], 0
+    for i, line in enumerate(lines):
+        if line.startswith("[") or line.startswith("#"):
+            header_lines.append(line)
+            body_start = i + 1
+        else:
+            break
+    header = "\n".join(header_lines)
+    intro = "\n".join(lines[body_start:q_idx[0]]).strip()
+
+    out = []
+    for n, qi in enumerate(q_idx):
+        end = q_idx[n + 1] if n + 1 < len(q_idx) else len(lines)
+        pair_lines = lines[qi:end]
+        # 下一对的 <callout 开场标签（及其前的空行）会被切进来，剥掉避免污染
+        while pair_lines and (not pair_lines[-1].strip()
+                              or pair_lines[-1].strip().startswith("<callout")):
+            pair_lines.pop()
+        pair = "\n".join(pair_lines).strip()
+        if not pair:
+            continue
+        parts = [p for p in [header, intro if n == 0 else "", pair] if p]
+        chunk = "\n".join(parts)
+        if len(chunk) > _MAX_SECTION_CHARS * 2:  # 超长对（罕见）截断保护
+            chunk = chunk[:_MAX_SECTION_CHARS * 2]
+        out.append(chunk)
+    return out
+
+
+_BOLD_NUM_HEADER_RE = re.compile(
+    r'^\*\*[0-9]+\.[0-9]+(?=[^*\n]*[一-鿿])'
+)
+
+
+def _split_bold_headers(content: str) -> list[str]:
+    """按粗体编号标题（如"**4.7 产检假**"）切分，让每个细分条款独立成 chunk。
+
+    制度手册的休假/考勤等章节用 **N.N 标题** 标记细分条目（各种假别），
+    整章常 <1600 字、不会走超长段落切分，导致多个条目挤在同一 chunk，
+    具体查询（"产检假几天"）召不回。这里优先按粗体编号标题拆开。
+    标题分两类：短标题（**4.7 产检假**）和长/断行标题（**4.3 加班…如果无法**
+    换行后才收尾，或标题超 25 字），所以只匹配行首 **N.N + 后文含中文，不再要求
+    同行的闭合 **。无 ≥2 个粗体编号标题时返回空列表，调用方走原逻辑。"""
+    lines = content.split("\n")
+    header_idx = [i for i, l in enumerate(lines) if _BOLD_NUM_HEADER_RE.match(l.strip())]
+    if len(header_idx) < 2:
+        return []
+    lead, body_start = [], 0
+    for i, l in enumerate(lines):
+        if l.startswith("[") or l.startswith("#"):
+            lead.append(l)
+            body_start = i + 1
+        else:
+            break
+    header = "\n".join(lead)
+    intro = "\n".join(lines[body_start:header_idx[0]]).strip()
+    out = []
+    for n, idx in enumerate(header_idx):
+        end = header_idx[n + 1] if n + 1 < len(header_idx) else len(lines)
+        seg = "\n".join(lines[idx:end]).strip()
+        if not seg.strip():
+            continue
+        parts = [p for p in [header, intro if n == 0 else "", seg] if p]
+        out.append("\n".join(parts))
+    return out
+
+
 def _chunk_large_section(title: str, content: str) -> list[dict]:
     """把超长 section 按段落切成 ≤ _MAX_SECTION_CHARS 的小块，每块保留标题上下文行。"""
+    qa = _split_qa_pairs(content)
+    if qa:
+        return [{"title": title, "keywords": sorted(_tokenize(c)), "content": c} for c in qa]
+    bold = _split_bold_headers(content)
+    if bold:
+        return [{"title": title, "keywords": sorted(_tokenize(c)), "content": c} for c in bold]
     if len(content) <= _MAX_SECTION_CHARS:
         return [{"title": title, "keywords": sorted(_tokenize(content)), "content": content}]
 
@@ -317,23 +407,55 @@ def _chunk_large_section(title: str, content: str) -> list[dict]:
     return [{"title": title, "keywords": sorted(_tokenize(c)), "content": c} for c in chunks]
 
 
+def _is_table_fragment(part: str, title: str, body_lines: list[str]) -> bool:
+    """识别表格型文档被切碎的章节：标题无语义（纯序号/一二字），正文大半是表格行。
+    这类章节（如 "## 3" 下只有一行表格）独立索引会让检索完全失效，应合并处理。"""
+    junk_title = not re.search(r'[一-鿿]{3,}|[A-Za-z]{3,}', title)
+    if not junk_title or not body_lines:
+        return False
+    table_rows = sum(1 for l in body_lines if l.strip().startswith('|'))
+    return table_rows / len(body_lines) >= 0.5
+
+
 def _scan_file(md_path: Path) -> list[dict]:
     """把一个 MD 文件切成 section 列表，子章节携带父级标题作为上下文。"""
     text = md_path.read_text(encoding="utf-8")
     parts = re.split(r"\n(?=#{1,3} )", text)
     sections = []
     h1 = h2 = ""
+    frag_buf: list[str] = []  # 连续表格碎片，攒起来合并成一块
+
+    def flush_fragments():
+        if not frag_buf:
+            return
+        body = "\n\n".join(frag_buf)
+        frag_buf.clear()
+        title = md_path.stem
+        sections.extend(_chunk_large_section(title, f"[{title}]\n{body}"))
 
     for part in parts:
         part = part.strip()
-        if not part or len(part) < 20:
-            continue
-        # Skip stub sections: heading with no real body (e.g. "## 4. Title" followed by nothing)
-        body_lines = [l for l in part.splitlines()[1:] if l.strip()]
-        if not body_lines or len("".join(body_lines)) < 30:
+        if not part:
             continue
         first_line = part.splitlines()[0]
         title = first_line.lstrip("#").strip()
+        body_lines = [l for l in part.splitlines()[1:] if l.strip()]
+
+        if _is_table_fragment(part, title, body_lines):
+            frag_buf.append("\n".join(body_lines))
+            continue
+        flush_fragments()
+
+        is_stub = len(part) < 20 or not body_lines or len("".join(body_lines)) < 30
+        if is_stub:
+            # 短章节不再丢弃：并入前一条章节，短命令/短说明也有检索价值
+            if sections:
+                sections[-1]["content"] += "\n" + part
+                sections[-1]["keywords"] = sorted(_tokenize(sections[-1]["content"]))
+            else:
+                frag_buf.append("\n".join([first_line] + body_lines))
+            continue
+
         level = len(first_line) - len(first_line.lstrip("#"))
 
         if level == 1:
@@ -349,7 +471,44 @@ def _scan_file(md_path: Path) -> list[dict]:
 
         sections.extend(_chunk_large_section(title, content))
 
+    flush_fragments()
     return sections
+
+
+_vec_building = False
+_vec_build_lock = threading.Lock()
+
+
+def _rebuild_vectors_bg(index: dict, files_index: dict, truly_changed: list, persist) -> None:
+    """后台线程重建向量：全量 embedding 约 10 分钟，同步跑会堵死查询线程。
+    重建期间 search() 继续用旧向量（build 内部原子替换）；失败回滚 mtime 等下轮重试。"""
+    global _vec_building
+    with _vec_build_lock:
+        if _vec_building:
+            log.info("向量重建已在后台进行，跳过重复触发")
+            return
+        _vec_building = True
+
+    def _run():
+        global _vec_building
+        try:
+            import vector_store as _vs
+            _vs.build(index)
+        except Exception as e:
+            log.error("向量索引后台构建失败，回滚 mtime 待下轮重试: %s", e)
+            for k in truly_changed:
+                if k in files_index:
+                    files_index[k]["mtime"] = 0
+            try:
+                persist()
+            except Exception as e2:
+                log.error("mtime 回滚写入失败: %s", e2)
+        finally:
+            with _vec_build_lock:
+                _vec_building = False
+
+    threading.Thread(target=_run, daemon=True, name="vector-rebuild").start()
+    log.info("向量重建已转入后台线程（查询不受影响）")
 
 
 def build_index(force: bool = False) -> dict:
@@ -380,7 +539,8 @@ def build_index(force: bool = False) -> dict:
         if not mtime_unchanged:
             truly_changed.append(key)
 
-    # 删除已不存在的文件条目
+    # 删除已不存在的文件条目；删除也视为内容变化，必须触发向量重建，
+    # 否则已下线文档的 chunk 会永久留在向量索引里被召回答复员工
     existing_keys = {
         md.relative_to(KB_DIR).as_posix()
         for md in all_mds
@@ -389,6 +549,7 @@ def build_index(force: bool = False) -> dict:
     for k in list(files_index.keys()):
         if k not in existing_keys:
             del files_index[k]
+            truly_changed.append(k)
 
     for key, md, mtime in changed:
         try:
@@ -401,28 +562,28 @@ def build_index(force: bool = False) -> dict:
     index["idf"] = _compute_idf(files_index)
     index["built_at"] = datetime.datetime.now().isoformat(timespec="seconds")
 
-    # 原子写：写临时文件再重命名，防止多进程并发损坏
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=DOCS_DIR, suffix=".json.tmp")
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, INDEX_PATH)
-    except Exception:
-        os.unlink(tmp_path)
-        raise
+    def _persist():
+        # 原子写：写临时文件再重命名，防止多进程并发损坏
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=DOCS_DIR, suffix=".json.tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, INDEX_PATH)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+
+    _persist()
 
     if changed:
         _write_manifest(index)
 
     # 向量索引：仅当 KB 文件 mtime 真正变化，或向量文件不存在时才重建
     # （force=True 但文件内容未变时跳过，避免 bot 每次重启都重建向量）
+    # 后台线程执行：全量 embedding 约 10 分钟，同步跑会把查询全堵死
     _vec_path = DOCS_DIR / "kb-vectors.npy"
     if truly_changed or not _vec_path.exists():
-        try:
-            import vector_store as _vs
-            _vs.build(index)
-        except Exception as e:
-            log.warning("向量索引构建失败（不影响主功能）: %s", e)
+        _rebuild_vectors_bg(index, files_index, truly_changed, _persist)
     else:
         log.info("KB 内容未变，跳过向量重建")
 

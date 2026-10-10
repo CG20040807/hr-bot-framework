@@ -8,6 +8,7 @@
 
 import json
 import logging
+import os
 import threading
 import time
 import warnings
@@ -28,6 +29,8 @@ _model   = None
 _model_loading = False           # True while background thread is downloading
 _vectors: Optional[np.ndarray] = None
 _meta:    Optional[list]       = None
+_write_lock = threading.Lock()  # protects build() / _load() / search() lazy init
+_load_lock  = threading.Lock()
 
 
 def _get_model():
@@ -77,7 +80,7 @@ def _encode(texts: list[str]) -> np.ndarray:
 
 
 def build(index: dict) -> None:
-    """对 KB 索引中所有章节做 embedding 并保存到磁盘。"""
+    """对 KB 索引中所有章节做 embedding 并保存到磁盘（原子写入）。"""
     global _vectors, _meta
     sections = []
     for fname, fdata in index.get("files", {}).items():
@@ -93,7 +96,6 @@ def build(index: dict) -> None:
         log.warning("vector_store.build: 没有章节可向量化")
         return
 
-    # multilingual-e5 用 "passage: " 前缀表示文档段落
     texts = [f"passage: {s['title']} {s['content'][:400]}" for s in sections]
 
     log.info("向量化 %d 个 KB 章节...", len(sections))
@@ -102,18 +104,26 @@ def build(index: dict) -> None:
     log.info("向量化完成: %d 章节, %.1fs", len(sections), time.time() - t0)
 
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    np.save(_VECTORS_PATH, vecs)
-    _META_PATH.write_text(
-        json.dumps(sections, ensure_ascii=False, indent=None), encoding="utf-8"
-    )
-    _vectors = vecs
-    _meta    = sections
+    with _write_lock:
+        # 先写临时文件，再原子 rename，防止并发 reader 读到半写文件
+        tmp_vec = _VECTORS_PATH.with_suffix(".tmp.npy")
+        tmp_meta = _META_PATH.with_suffix(".tmp.json")
+        np.save(tmp_vec, vecs)
+        tmp_meta.write_text(
+            json.dumps(sections, ensure_ascii=False, indent=None), encoding="utf-8"
+        )
+        os.replace(tmp_vec, _VECTORS_PATH)
+        os.replace(tmp_meta, _META_PATH)
+        _vectors = vecs
+        _meta    = sections
     log.info("向量索引已保存: %s", _VECTORS_PATH)
 
 
 def _load() -> bool:
-    """从磁盘加载已构建的向量索引，返回是否成功。"""
+    """从磁盘加载已构建的向量索引，返回是否成功（调用方需持 _load_lock）。"""
     global _vectors, _meta
+    if _vectors is not None:
+        return True
     try:
         _vectors = np.load(_VECTORS_PATH)
         _meta    = json.loads(_META_PATH.read_text(encoding="utf-8"))
@@ -137,22 +147,27 @@ def search(query: str, top_k: int = 12, min_score: float = _MIN_SIMILARITY,
     """
     global _vectors, _meta
     if _model is None:
-        return []   # 模型还在下载，跳过向量检索，降级 BM25
-
-    if _vectors is None and not _load():
         return []
+
+    if _vectors is None:
+        with _load_lock:
+            if _vectors is None:
+                if not _load():
+                    return []
 
     prefix = "passage: " if is_hyde else "query: "
     q_vec = _encode([f"{prefix}{query}"])[0]
-    scores = _vectors @ q_vec                 # cosine similarity (已归一化)
-    top_idx = np.argsort(scores)[::-1][:top_k * 2]  # 多取一些，过滤后还够用
+    with _write_lock:
+        _v, _m = _vectors, _meta
+    scores = _v @ q_vec
+    top_idx = np.argsort(scores)[::-1][:top_k * 2]
 
     results = [
         (float(scores[i]),
-         _meta[i]["fname"],
-         _meta[i]["mtime"],
-         _meta[i]["title"],
-         _meta[i]["content"])
+         _m[i]["fname"],
+         _m[i]["mtime"],
+         _m[i]["title"],
+         _m[i]["content"])
         for i in top_idx
         if float(scores[i]) >= min_score
     ]

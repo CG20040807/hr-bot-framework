@@ -18,9 +18,9 @@ lark_sync.py — 自动同步 Lark 知识库到本地 KB 文件。
 
 import argparse
 import hashlib
-import os
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -314,12 +314,43 @@ def _lark_table_to_md(table_str: str) -> str:
     return '\n'.join(result)
 
 
+def _html_table_to_md(table_str: str) -> str:
+    """将新版导出格式的 <table><tr><td> HTML 表格转换为 markdown 管道表格。"""
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_str, re.DOTALL)
+    if not rows:
+        return ''
+    result = []
+    for i, row in enumerate(rows):
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL)
+        clean = []
+        for c in cells:
+            c = re.sub(r'<li[^>]*>(.*?)</li>', r'\1; ', c, flags=re.DOTALL)  # 单元格内列表
+            c = re.sub(r'<br\s*/?>', ' / ', c)     # 单元格内换行
+            c = re.sub(r'<[^>]+>', '', c)           # 去掉内层标签
+            c = re.sub(r'\*+([^*]+)\*+', r'\1', c) # 去掉加粗
+            c = ' '.join(c.split())
+            clean.append(c.strip())
+        if clean:
+            result.append('| ' + ' | '.join(clean) + ' |')
+            if i == 0:
+                result.append('|' + '---|' * len(clean))
+    return '\n'.join(result)
+
+
 def lark_markdown_to_clean(md: str) -> str:
     """将 Lark 特有 markdown 标签转换为纯文本/标准 markdown。"""
+    # 文档标题 → 一级标题
+    md = re.sub(r'<title>(.*?)</title>', r'# \1', md, flags=re.DOTALL)
     # lark-table → pipe table
     md = re.sub(
         r'<lark-table[^>]*>(.*?)</lark-table>',
         lambda m: _lark_table_to_md(m.group(1)),
+        md, flags=re.DOTALL
+    )
+    # 新版导出的标准 HTML table → pipe table
+    md = re.sub(
+        r'<table[^>]*>(.*?)</table>',
+        lambda m: _html_table_to_md(m.group(1)),
         md, flags=re.DOTALL
     )
     # mention-doc → [标题](URL)，保留链接供 bot 推送
@@ -335,6 +366,30 @@ def lark_markdown_to_clean(md: str) -> str:
         url = f"https://your-tenant.larksuite.com/{path}/{token_m.group(1)}"
         return f"[{title}]({url})"
     md = re.sub(r'<mention-doc[^>]*>(.*?)</mention-doc>', _mention_doc_to_link, md, flags=re.DOTALL)
+    # cite（新版导出格式的内嵌文档引用）→ [标题](URL)
+    def _cite_to_link(m: re.Match) -> str:
+        attrs = m.group(1)
+        id_m = re.search(r'doc-id="([^"]+)"', attrs)
+        ft_m = re.search(r'file-type="([^"]+)"', attrs)
+        ti_m = re.search(r'title="([^"]*)"', attrs)
+        title = (ti_m.group(1).strip() if ti_m and ti_m.group(1).strip() else None)
+        if not id_m or not ft_m:
+            return title or ""
+        _type_path = {"wiki": "wiki", "docx": "docx", "sheets": "sheets", "sheet": "sheets", "bitable": "base"}
+        path = _type_path.get(ft_m.group(1), ft_m.group(1))
+        url = f"https://your-tenant.larksuite.com/{path}/{id_m.group(1)}"
+        return f"[{title or id_m.group(1)}]({url})"
+    md = re.sub(r'<cite\s+([^>]*)>\s*(.*?)\s*</cite>', _cite_to_link, md, flags=re.DOTALL)
+    # source（新版导出格式的附件/PDF）→ [文件名](URL)
+    def _source_tag(m: re.Match) -> str:
+        tag = m.group(0)
+        name_m = re.search(r'name="([^"]*)"', tag)
+        token_m = re.search(r'token="([^"]*)"', tag)
+        name = name_m.group(1) if name_m else "附件"
+        if token_m:
+            return f'[{name}](https://your-tenant.larksuite.com/file/{token_m.group(1)})'
+        return f'[附件: {name}]'
+    md = re.sub(r'<source\b[^>]*/>', _source_tag, md)
     # text 样式标签 → 内容
     md = re.sub(r'<text[^>]*>(.*?)</text>', r'\1', md, flags=re.DOTALL)
     # callout / quote-container / grid / column / view → 保留内容
@@ -369,7 +424,7 @@ def fetch_lark_doc(url: str) -> Optional[dict]:
     if "/wiki/" not in url and "/docx/" not in url:
         log.error("无法识别的 Lark URL 格式: %s", url)
         return None
-    cmd = ["lark-cli", "docs", "+fetch", "--doc", url, "--as", "user"]
+    cmd = ["lark-cli", "docs", "+fetch", "--doc", url, "--as", "user", "--doc-format", "markdown"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
@@ -388,7 +443,10 @@ def fetch_lark_doc(url: str) -> Optional[dict]:
 
 
 def extract_subpage_tokens(lark_md: str) -> list:
-    """从 Lark markdown 中提取所有 <mention-doc token="..." type="...">Title</mention-doc> 引用。
+    """从 Lark markdown 中提取内嵌文档引用。
+    兼容两种导出格式：
+      旧版 <mention-doc token="..." type="...">Title</mention-doc>
+      新版 <cite doc-id="..." file-type="wiki|docx" title="..." type="doc"></cite>
     返回 [(token, title, doc_type)] 列表，去重，保持顺序。
     """
     seen = set()
@@ -401,14 +459,50 @@ def extract_subpage_tokens(lark_md: str) -> list:
         if token not in seen:
             seen.add(token)
             pairs.append((token, title, doc_type))
+    for m in re.finditer(r'<cite\s+([^>]*)>(.*?)</cite>', lark_md, re.DOTALL):
+        attrs = m.group(1)
+        id_m = re.search(r'doc-id="([^"]+)"', attrs)
+        ft_m = re.search(r'file-type="([^"]+)"', attrs)
+        ti_m = re.search(r'title="([^"]*)"', attrs)
+        if not id_m or not ft_m:
+            continue
+        token, doc_type = id_m.group(1), ft_m.group(1)
+        title = ti_m.group(1).strip() if ti_m else token
+        if doc_type in ("wiki", "docx") and token not in seen:
+            seen.add(token)
+            pairs.append((token, title, doc_type))
     return pairs
+
+
+_AUTH_FAILED = False  # 本轮同步是否遇到用户授权失效（need_user_authorization）
+
+# 已审批 scope 清单（2026-08-13 验证）：device flow 只从这张清单里取，
+# 用 --domain/--recommend 会带上未审批 scope，导致授权页 Unknown error、令牌发不下来
+_APPROVED_SCOPES = (
+    "auth:user.id:read base:app:copy base:app:create base:app:read base:field:create "
+    "base:field:read base:record:create base:record:delete base:record:read base:record:update "
+    "base:table:read base:view:read board:whiteboard:node:create board:whiteboard:node:read "
+    "calendar:calendar.event:create calendar:calendar.event:read calendar:calendar.event:reply "
+    "calendar:calendar.event:update calendar:calendar.free_busy:read calendar:calendar:read "
+    "contact:department.base:readonly contact:user.base:readonly contact:user.basic_profile:readonly "
+    "contact:user:search docs:document.media:upload docx:document:create docx:document:readonly "
+    "docx:document:write_only im:chat.members:read im:chat.members:write_only im:chat:read "
+    "im:message im:message.group_msg:get_as_user im:message.p2p_msg:get_as_user"
+)
+
+
+def _mark_auth_failure(output: str) -> None:
+    """lark-cli 返回中包含授权失效标记时置旗，sync 末尾据此触发自愈。"""
+    global _AUTH_FAILED
+    if "need_user_authorization" in (output or ""):
+        _AUTH_FAILED = True
 
 
 def fetch_lark_doc_ex(url: str) -> Tuple[Optional[dict], Optional[str]]:
     """拉取 Lark 文档，返回 (result_dict, error_reason)，成功时 error_reason 为 None。"""
     if "/wiki/" not in url and "/docx/" not in url:
         return None, f"无法识别的 URL 格式: {url}"
-    cmd = ["lark-cli", "docs", "+fetch", "--doc", url, "--as", "user"]
+    cmd = ["lark-cli", "docs", "+fetch", "--doc", url, "--as", "user", "--doc-format", "markdown"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
@@ -421,6 +515,7 @@ def fetch_lark_doc_ex(url: str) -> Tuple[Optional[dict], Optional[str]]:
                     err = f"错误码 {code}: {msg}"
             except Exception:
                 pass
+            _mark_auth_failure(result.stdout + result.stderr)
             return None, err or "未知错误"
         return json.loads(result.stdout), None
     except subprocess.TimeoutExpired:
@@ -495,7 +590,9 @@ def get_revision_and_content(fetch_result: dict) -> Tuple[Optional[str], Optiona
     """从 lark-cli 返回结果中提取 revision_id（内容 hash）和 markdown 内容。"""
     try:
         data = fetch_result.get("data", {})
-        md = data.get("markdown", "")
+        # lark-cli ≥1.0.84：+fetch 默认 XML 且键为 data.document.content；
+        # 旧版为 data.markdown。两者都兼容，取 markdown 导出（--doc-format markdown）。
+        md = data.get("markdown") or (data.get("document") or {}).get("content", "")
         if not md:
             return None, None
         revision_id = hashlib.md5(md.encode()).hexdigest()
@@ -513,6 +610,7 @@ def fetch_lark_sheet(spreadsheet_token: str) -> Optional[dict]:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             log.error("lark-cli sheets +read 失败 (%s): %s", spreadsheet_token, result.stderr.strip())
+            _mark_auth_failure(result.stdout + result.stderr)
             return None
         return json.loads(result.stdout)
     except subprocess.TimeoutExpired:
@@ -552,6 +650,7 @@ def fetch_lark_bitable(base_token: str, table_id: str) -> Optional[str]:
         if result.returncode != 0:
             log.error("lark-cli base +record-list 失败 (%s/%s): %s",
                       base_token, table_id, result.stderr.strip())
+            _mark_auth_failure(result.stdout + result.stderr)
             return None
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
@@ -706,6 +805,73 @@ def _notify_sync_result(changed_files: set[str], total_changed: int) -> None:
         log.warning("同步通知发送异常: %s", e)
 
 
+def _self_heal_auth() -> None:
+    """用户授权失效自愈：发授权链接给管理员，等授权完成后自动重跑一轮同步。
+
+    - 2 小时内最多发一次链接（.auth_heal_state.json 限流），防止定时任务反复轰炸
+    - 授权等待最长 10 分钟（device flow 有效期），超时则等下一轮定时同步再试
+    - 重跑子进程带 KB_SYNC_HEALED=1，若授权仍不全也不会再次触发自愈（防循环）
+    """
+    heal_state = SCRIPT_DIR / ".auth_heal_state.json"
+    try:
+        if heal_state.exists():
+            last = json.loads(heal_state.read_text(encoding="utf-8")).get("last_sent", "")
+            if last and (datetime.datetime.now() - datetime.datetime.fromisoformat(last)).total_seconds() < 2 * 3600:
+                log.warning("授权失效，但 2 小时内已发过授权链接，跳过重复发送")
+                return
+    except Exception:
+        pass
+
+    try:
+        r = subprocess.run(
+            ["lark-cli", "auth", "login", "--scope", _APPROVED_SCOPES,
+             "--no-wait", "--json"],
+            capture_output=True, text=True, timeout=20,
+        )
+        payload = json.loads(r.stdout)
+        device_code, verify_url = payload["device_code"], payload["verification_url"]
+    except Exception as e:
+        log.error("授权自愈：无法发起设备授权流程: %s", e)
+        return
+
+    text = (
+        "🔐 KB 同步授权失效\n"
+        "云端文档读取权限（docs/sheets/wiki）已过期，请点链接重新授权（10 分钟内有效）：\n"
+        f"{verify_url}\n"
+        "授权完成后我会自动登录并重跑同步。\n\n"
+        "由自动化脚本发送"
+    )
+    try:
+        subprocess.run(
+            ["lark-cli", "im", "+messages-send",
+             "--user-id", os.environ.get("HR_ADMIN_OPEN_ID", ""),
+             "--text", text, "--as", "bot"],
+            capture_output=True, text=True, timeout=15,
+        )
+        heal_state.write_text(json.dumps(
+            {"last_sent": datetime.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False))
+        log.warning("授权失效，授权链接已发管理员，等待授权（最长 10 分钟）...")
+    except Exception as e:
+        log.error("授权自愈：发送授权链接失败: %s", e)
+        return
+
+    try:
+        r2 = subprocess.run(
+            ["lark-cli", "auth", "login", "--device-code", device_code],
+            capture_output=True, text=True, timeout=660,
+        )
+        if r2.returncode != 0:
+            log.warning("授权自愈：等待授权未完成，下次定时同步再试: %s", r2.stderr.strip()[:200])
+            return
+    except subprocess.TimeoutExpired:
+        log.warning("授权自愈：10 分钟内未完成授权，下次定时同步再试")
+        return
+
+    log.info("授权已完成，自动重跑同步...")
+    env = dict(os.environ, KB_SYNC_HEALED="1")
+    subprocess.run([sys.executable, str(SCRIPT_DIR / "lark_sync.py")], env=env)
+
+
 def _run_dead_link_cleanup(dry_run: bool, fix: bool = False) -> None:
     """扫描 KB 内联链接 + kb_url_map 推送链接，检测死链。
     - 始终写入 bot.py 黑名单(--update-bot)：非破坏、可逆，确保 bot 不再推失效链接。
@@ -732,6 +898,7 @@ def _run_dead_link_cleanup(dry_run: bool, fix: bool = False) -> None:
 def _refresh_url_map(config: dict) -> None:
     """从 sync_sources.json 刷新 kb_url_map.json，保留已有标签（含手写条目）。"""
     url_map_path = SCRIPT_DIR / "kb_url_map.json"
+    kb_dir = SCRIPT_DIR / config.get("kb_dir", "kb")
     import json as _json
     old_map: dict = {}
     if url_map_path.exists():
@@ -749,8 +916,97 @@ def _refresh_url_map(config: dict) -> None:
                 label = src.get("notes", "").split(" / ")[0].strip() or fname.replace(".md", "")
                 new_map[fname] = {"url": src["url"], "label": label}
                 break
+    # 标记不在 sync_sources.json 中但有 URL 映射的条目（手工维护的孤儿）
+    synced_fnames = {e["local_file"] for e in config.get("kb_files", [])}
+    for fname in sorted(new_map):
+        if fname not in synced_fnames:
+            info = new_map[fname]
+            if "内容暂未录入知识库" not in (kb_dir / fname).read_text(encoding="utf-8")[:500] if (kb_dir / fname).exists() else True:
+                log.warning("[url-map] %s 不在 sync_sources.json 中，保留已有 URL 映射（手动条目）", fname)
+
     url_map_path.write_text(_json.dumps(new_map, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("kb_url_map.json 已刷新：%d 项", len(new_map))
+
+
+def _audit_orphans(config: dict, kb_dir: Path, url_map_path: Path) -> None:
+    """扫描 kb/*.md，检查孤儿文件：不在 sync_sources.json 且不在 kb_url_map.json。"""
+    import json as _json
+
+    synced_fnames = {e["local_file"] for e in config.get("kb_files", [])}
+
+    url_map: dict = {}
+    if url_map_path.exists():
+        try:
+            url_map = _json.loads(url_map_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    kb_dir_resolved = kb_dir if isinstance(kb_dir, Path) else Path(kb_dir)
+    content_orphans = []
+    stub_orphans = []
+
+    for md_path in sorted(kb_dir_resolved.glob("*.md")):
+        fname = md_path.name
+        in_sync = fname in synced_fnames
+        in_map = fname in url_map
+
+        if in_sync or in_map:
+            continue  # 至少有一方覆盖，不算孤儿
+
+        preview = md_path.read_text(encoding="utf-8")[:500]
+        is_stub = "内容暂未录入知识库" in preview
+
+        # 尝试从文件内容提取 URL
+        url_match = re.search(r'https://[^\s)]+larksuite\.com/[^\s)]+', preview)
+        extracted_url = url_match.group(0) if url_match else ""
+
+        if is_stub:
+            stub_orphans.append((fname, extracted_url))
+        else:
+            content_orphans.append((fname, extracted_url))
+
+    if content_orphans or stub_orphans:
+        sep = "━" * 60
+        print(f"\n{sep}")
+        print(f"⚠️  孤儿文件检测")
+        print(sep)
+
+        if content_orphans:
+            print(f"\n实质内容文件（需加入 sync_sources.json）：")
+            for fname, url in content_orphans:
+                hint = f" → {url}" if url else " — 未找到 Lark URL，请手动确认"
+                print(f"  ❌ {fname}{hint}")
+
+        if stub_orphans:
+            print(f"\nPDF/PPT 附件 stub（无法提取内容，保留链接）：")
+            for fname, url in stub_orphans:
+                hint = f" → {url}" if url else " — 未找到 Lark URL，请手动确认"
+                print(f"  📎 {fname}{hint}")
+
+        print(sep + "\n")
+
+        if content_orphans:
+            log.error("孤儿检测：%d 个实质内容文件缺少 URL 映射，链接推送将漏链", len(content_orphans))
+        if stub_orphans:
+            log.warning("孤儿检测：%d 个 PDF/PPT stub 缺少 URL 映射", len(stub_orphans))
+    else:
+        log.info("孤儿检测：所有 KB 文件均有 sync 或 URL 映射覆盖，无遗漏。")
+
+    # 对已有 URL 映射但不在 sync 的实质内容文件，发出提醒
+    manual_content = []
+    for fname in sorted(url_map):
+        if fname not in synced_fnames:
+            fpath = kb_dir_resolved / fname
+            if fpath.exists():
+                preview = fpath.read_text(encoding="utf-8")[:500]
+                if "内容暂未录入知识库" not in preview:
+                    manual_content.append(fname)
+
+    if manual_content:
+        log.warning(
+            "孤儿检测：%d 个实质内容文件有 URL 映射但不在 sync_sources.json（不会自动同步更新）: %s",
+            len(manual_content), ", ".join(manual_content)
+        )
 
 
 def _discover_new_pages(config: dict, kb_dir: Path) -> list[dict]:
@@ -931,6 +1187,9 @@ def run_sync(dry_run: bool = False, force: bool = False) -> None:
             print(f"   {p['url']}")
         print(f"{sep}\n")
 
+    # 孤儿文件检测：所有 kb/*.md 必须在 sync_sources.json 或 kb_url_map.json 中有记录
+    _audit_orphans(config, kb_dir, SCRIPT_DIR / "kb_url_map.json")
+
     # 持久化潜在新页面清单，供 kb_healer.py 每日匹配未解答问题时读取
     # （只在真实同步时写入，dry-run 保持零副作用）
     if not dry_run:
@@ -968,15 +1227,83 @@ def run_sync(dry_run: bool = False, force: bool = False) -> None:
         except Exception as e:
             log.error("无法调用 index_manager.py: %s", e)
 
+    # 用户授权失效自愈：发链接、等授权、自动重跑（KB_SYNC_HEALED 防循环）
+    if _AUTH_FAILED and not dry_run and not os.environ.get("KB_SYNC_HEALED"):
+        _self_heal_auth()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="同步 Lark 知识库到本地 KB 文件")
     parser.add_argument("--dry-run", action="store_true", help="检查变化但不写入文件")
     parser.add_argument("--force", action="store_true", help="强制重新拉取所有源，忽略 revision_id 缓存")
     parser.add_argument("--discover", action="store_true", help="只扫描 KB 发现潜在新页面，不执行同步")
+    parser.add_argument("--list", action="store_true", help="列出所有同步源")
+    parser.add_argument("--add", action="store_true", help="添加新的同步源")
+    parser.add_argument("--remove", action="store_true", help="移除同步源")
+    parser.add_argument("--file", type=str, help="目标本地文件名（用于 --add/--remove）")
+    parser.add_argument("--url", type=str, help="Lark 文档 URL（用于 --add/--remove）")
+    parser.add_argument("--type", type=str, choices=["wiki", "docx", "sheet", "bitable"],
+                        help="文档类型（用于 --add）")
+    parser.add_argument("--lang", type=str, choices=["zh", "en", "bilingual"], default="bilingual",
+                        help="文档语言（用于 --add，默认 bilingual）")
     args = parser.parse_args()
 
-    if args.discover:
+    if args.list:
+        config = json.loads(SYNC_SOURCES.read_text(encoding="utf-8"))
+        for f in config.get("kb_files", []):
+            print(f"\n📄 {f['local_file']}")
+            for s in f.get("sources", []):
+                notes = f"  — {s.get('notes', '')}" if s.get("notes") else ""
+                print(f"  [{s.get('doc_type', '?')}] {s['url']}  lang={s.get('lang', '?')}{notes}")
+        print()
+    elif args.add:
+        if not args.file or not args.url or not args.type:
+            print("错误：--add 需要 --file、--url、--type 参数")
+            sys.exit(1)
+        config = json.loads(SYNC_SOURCES.read_text(encoding="utf-8"))
+        new_source = {
+            "url": args.url,
+            "doc_type": args.type,
+            "lang": args.lang,
+            "revision_id": None,
+            "section_marker": None,
+            "notes": "",
+        }
+        found = False
+        for f in config.get("kb_files", []):
+            if f["local_file"] == args.file:
+                f["sources"].append(new_source)
+                found = True
+                break
+        if not found:
+            config.setdefault("kb_files", []).append({
+                "local_file": args.file,
+                "sources": [new_source],
+            })
+        SYNC_SOURCES.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"✅ 已添加: {args.file} ← {args.url}")
+    elif args.remove:
+        if not args.file or not args.url:
+            print("错误：--remove 需要 --file、--url 参数")
+            sys.exit(1)
+        config = json.loads(SYNC_SOURCES.read_text(encoding="utf-8"))
+        for f in config.get("kb_files", []):
+            if f["local_file"] == args.file:
+                before = len(f["sources"])
+                f["sources"] = [s for s in f["sources"] if s["url"] != args.url]
+                if len(f["sources"]) == before:
+                    print(f"⚠️ 未找到匹配的 URL: {args.url}")
+                else:
+                    print(f"✅ 已从 {args.file} 移除: {args.url}")
+                break
+        else:
+            print(f"⚠️ 未找到文件: {args.file}")
+        SYNC_SOURCES.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    elif args.discover:
         config = json.loads(SYNC_SOURCES.read_text(encoding="utf-8"))
         kb_dir = SCRIPT_DIR / config.get("kb_dir", "kb")
         new_pages = _discover_new_pages(config, kb_dir)

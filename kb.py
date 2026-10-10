@@ -8,12 +8,13 @@
 
 import concurrent.futures
 import datetime
+import hashlib
 import logging
 import re
 import threading
 import time
 from index_manager import build_index, search as _idx_search
-from config import KB_DIR
+from config import DOCS_DIR, KB_DIR
 
 log = logging.getLogger(__name__)
 
@@ -43,10 +44,10 @@ _INTENT_MAP: list[tuple] = [
     # 婚假
     (re.compile(r"结婚.{0,4}假|婚假|结婚.{0,4}请假|要结婚"), ["婚假", "marriage", "假期"]),
     # 产假 / 陪产 (已有 LLM 边界，这里仍扩关键词让有内容时能命中)
-    (re.compile(r"产假|怀孕.{0,4}假|生孩子.{0,4}假|哺乳"), ["产假", "158", "上海", "maternity", "生育"]),
-    (re.compile(r"陪产|老婆.{0,4}生孩子|paternity"), ["陪产假", "男员工", "10天", "10 天", "生育"]),
+    (re.compile(r"产假|怀孕.{0,4}假|生孩子.{0,4}假|哺乳"), ["产假", "maternity", "生育"]),
+    (re.compile(r"陪产|老婆.{0,4}生孩子|paternity"), ["陪产假", "男员工", "生育"]),
     # 工资发放
-    (re.compile(r"几号.{0,4}工资|工资.{0,4}几号|什么时候.{0,4}工资|工资.{0,4}时候|发薪|薪水.{0,4}时间|工资.{0,4}到账|发工资|发了工资|工资发了|发没发工资|工资.{0,4}(有没有|到了吗|到没到)"), ["薪资", "工资", "15日", "发放"]),
+    (re.compile(r"几号.{0,4}工资|工资.{0,4}几号|什么时候.{0,4}工资|工资.{0,4}时候|发薪|薪水.{0,4}时间|工资.{0,4}到账|发工资|发了工资|工资发了|发没发工资|工资.{0,4}(有没有|到了吗|到没到)"), ["薪资", "工资", "发放"]),
     # 试用期 / 转正
     (re.compile(r"试用期.{0,4}多久|试用期.{0,4}几个月|多久.{0,4}转正|转正.{0,4}怎么|怎么.{0,4}转正|转正.{0,4}流程|过了试用"), ["转正", "试用期", "probation"]),
     # 报销
@@ -100,7 +101,7 @@ _INTENT_MAP: list[tuple] = [
     (re.compile(r"团建|团队活动|活动.{0,4}报销|团建.{0,4}费用"
                 r"|team building|team event|team activity|team outing", re.IGNORECASE), ["团建", "活动", "费用"]),
     # 工资发放 — 英文
-    (re.compile(r"when.{0,8}(get paid|paid|salary|paycheck|payday)|payday|payroll date|salary date", re.IGNORECASE), ["薪资", "工资", "15日", "发放"]),
+    (re.compile(r"when.{0,8}(get paid|paid|salary|paycheck|payday)|payday|payroll date|salary date", re.IGNORECASE), ["薪资", "工资", "发放"]),
     # 离职 — 英文
     (re.compile(r"(i want to|how do i|can i).{0,8}(quit|resign|leave the company)|notice period|resignation process|how to resign", re.IGNORECASE), ["离职", "辞职", "流程", "手续"]),
     # 打卡/补卡 — 英文
@@ -166,7 +167,10 @@ def _refresh_if_needed() -> None:
         current_mtime = _max_kb_mtime()
         if current_mtime != _last_max_mtime:
             build_index()  # 增量扫，只处理变化的文件
-            _last_max_mtime = current_mtime
+            # 向量索引文件还没生成时（首次构建中/构建失败）不推进 mtime，
+            # 让下个周期继续重试，避免"BM25 已新、向量索引停在旧版"
+            if (DOCS_DIR / "kb-vectors.npy").exists():
+                _last_max_mtime = current_mtime
             last_rebuilt_at = time.time()  # 通知 bot.py 清空对话历史
 
 
@@ -192,10 +196,20 @@ def _rrf_merge(
     score(d) = 1/(K + rank_bm25) + 1/(K + rank_vec)
     两路都召回的段落得分最高，只有一路的也能保留。
     """
-    # 格式化：从 BM25 字符串里提取"内容指纹"用于去重
+    # 去重键：文件名 + 内容前 1500 字的 hash。
+    # 之前用 content[:120]，面包屑表头长的章节（制度汇编类文档）不同 chunk 前缀相同，
+    # 会被误并为同一条：chunk 被丢弃、RRF 分数虚高。BM25 侧截断 2000 字、
+    # 向量侧保留全文，取 1500 字保证两侧对同一 chunk 算出的键一致。
+    def _chunk_key(fname: str, content: str) -> str:
+        h = hashlib.md5(content[:1500].encode("utf-8")).hexdigest()
+        return f"{fname}|{h}"
+
     # BM25 字符串格式：[来源: fname | 更新: date]\ncontent
     def _bm25_key(s: str) -> str:
-        return s.split("\n", 1)[1][:120] if "\n" in s else s[:120]
+        head, _, body = s.partition("\n")
+        m = re.match(r"\[来源:\s*([^|\]]+)", head)
+        fname = m.group(1).strip() if m else ""
+        return _chunk_key(fname, body)
 
     rrf: dict[str, float]  = {}
     store: dict[str, str]  = {}
@@ -207,7 +221,7 @@ def _rrf_merge(
 
     # 向量结果需格式化成与 BM25 相同的字符串
     for rank, (score, fname, mtime, title, content) in enumerate(vec_results):
-        k = content[:120]
+        k = _chunk_key(fname, content)
         rrf[k]   = rrf.get(k, 0.0) + 1.0 / (_RRF_K + rank + 1)
         if k not in store:
             mtime_str = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
@@ -232,23 +246,32 @@ _rewrite_client = None  # 延迟初始化，模块级复用，避免每次调用
 _rewrite_client_lock = threading.Lock()
 
 
+def _get_rewrite_client():
+    """rewrite/HyDE 专用 client。max_retries=2/timeout=20s：
+    网关挂起时三路并行检索会被 future 拖住，必须快速失败降级（静默返回空）。"""
+    global _rewrite_client
+    if _rewrite_client is None:
+        with _rewrite_client_lock:
+            if _rewrite_client is None:
+                from openai import OpenAI
+                from config import LLM_BASE_URL, LLM_API_KEY
+                _rewrite_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY,
+                                         max_retries=2, timeout=20)
+    return _rewrite_client
+
+
 def _hyde_query(query: str) -> str:
     """生成假设答案用于 HyDE 向量检索，失败静默返回空字符串。"""
-    global _rewrite_client
     try:
-        if _rewrite_client is None:
-            with _rewrite_client_lock:
-                if _rewrite_client is None:
-                    from openai import OpenAI
-                    from config import LLM_BASE_URL, LLM_API_KEY
-                    _rewrite_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+        client = _get_rewrite_client()
         from config import LLM_MODEL
-        resp = _rewrite_client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=LLM_MODEL, temperature=0, max_tokens=150,
             messages=[{"role": "user", "content":
                        "根据以下HR问题，写约100字的假设答案（无需完全准确，涵盖相关政策概念即可）：\n" + query}])
-        return resp.choices[0].message.content.strip()
-    except Exception:
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.warning("HyDE 生成失败（降级不用）: %s", e)
         return ""
 
 
@@ -258,16 +281,10 @@ def _llm_rewrite(query: str) -> list[str]:
     - 1 个 HR 手册章节标题风格（匹配 BM25 标题行）
     - 1 个 Step-Back 抽象类别（宽泛匹配，防止具体措辞不一致导致漏召回）
     失败时静默返回空列表。"""
-    global _rewrite_client
     try:
-        if _rewrite_client is None:
-            with _rewrite_client_lock:
-                if _rewrite_client is None:
-                    from openai import OpenAI
-                    from config import LLM_BASE_URL, LLM_API_KEY
-                    _rewrite_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+        client = _get_rewrite_client()
         from config import LLM_MODEL
-        resp = _rewrite_client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=LLM_MODEL,
             temperature=0,
             max_tokens=120,
@@ -282,9 +299,10 @@ def _llm_rewrite(query: str) -> list[str]:
                 ),
             }],
         )
-        lines = resp.choices[0].message.content.strip().splitlines()
+        lines = (resp.choices[0].message.content or "").strip().splitlines()
         return [l.strip() for l in lines if l.strip() and l.strip() != query][:4]
-    except Exception:
+    except Exception as e:
+        log.warning("LLM 改写失败（降级不用）: %s", e)
         return []
 
 
@@ -309,6 +327,29 @@ def _reorder_lost_in_middle(chunks: list[str]) -> list[str]:
     if len(chunks) <= 2:
         return chunks
     return [chunks[0]] + chunks[2:] + [chunks[1]]
+
+
+_SRC_RE = re.compile(r'^\[来源:\s*([^|]+?)\s*\|')
+
+
+def _diversify(scored: list, top_k: int, per_file: int = 2) -> list:
+    """Reranker 输出按来源文件限流：每文件最多 per_file 条，防止单一文档（尤其是
+    合规类长文档）挤占全部上下文名额，把真正相关的操作指引挤出 top_k。
+    名额不足时用溢出的 chunk 补齐，保证返回数量不缩水。"""
+    picked, overflow, counts = [], [], {}
+    for item in scored:
+        m = _SRC_RE.match(item[1])
+        fname = m.group(1).strip() if m else "?"
+        if counts.get(fname, 0) < per_file and len(picked) < top_k:
+            counts[fname] = counts.get(fname, 0) + 1
+            picked.append(item)
+        else:
+            overflow.append(item)
+    for item in overflow:
+        if len(picked) >= top_k:
+            break
+        picked.append(item)
+    return picked
 
 
 def search(query: str, top_k: int = 6, min_score: int = 1,
@@ -379,9 +420,18 @@ def search(query: str, top_k: int = 6, min_score: int = 1,
     if _cs.enabled():
         scored = _cs.apply(scored)
 
+    picked = _diversify(scored, top_k)
+    # BM25 精确关键词命中保护：语义 reranker 可能把表面词匹配弱但关键词精确命中的
+    # chunk（如"怎么查看AI用量"命中"用量查看工具"章节）挤出 top_k，强制保留前 2 条
+    if bm25:
+        have = {c for _, c in picked}
+        for c in bm25[:2]:
+            if c not in have:
+                picked = picked[:-1] + [(None, c)] if len(picked) >= top_k else picked + [(None, c)]
+                have.add(c)
     # Lost-in-the-Middle 修复：最高分置首，次高分置尾，LLM 对首尾注意力最强
     # （分数随 chunk 一起重排，供链接推送按相关性分级使用）
-    scored = _reorder_lost_in_middle(scored[:top_k])
+    scored = _reorder_lost_in_middle(picked)
     if with_scores:
         return scored
     return [c for _, c in scored]

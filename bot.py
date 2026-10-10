@@ -8,8 +8,10 @@ from __future__ import annotations  # 让类型注解变成字符串，避免 la
 
 import json
 import logging
+import logging.handlers
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -68,7 +70,6 @@ _socket.getaddrinfo = _patched_getaddrinfo
 import config as _config
 from config import APP_ID, APP_SECRET, ADMIN_OPEN_ID
 from kb import search, has_intent
-import credit_store
 from llm import answer, answer_stream, is_guard_query, strip_preamble, strip_article_citations, needs_clarification, clarify, _detect_lang, self_check
 import question_log
 
@@ -85,18 +86,39 @@ P2CardActionTrigger = P2CardActionTriggerResponse = None  # type: ignore
 CallBackToast = CallBackCard = None  # type: ignore
 
 _ADMIN_OPEN_ID = ADMIN_OPEN_ID  # 管理员 open_id（在 config.py 中配置）
+import credit_store
 _ADMIN_RELOAD_CMDS = frozenset(["kb重载", "kb reload", "/kb-reload", "知识库重载", "/kb"])
 _ADMIN_SYNC_CMDS = frozenset(["同步", "sync", "/sync", "kb同步"])
 _ADMIN_KB_CONFIRM_CMDS = frozenset(["确认补充", "confirm kb", "/kb-confirm"])
 _ADMIN_KB_DISMISS_CMDS = frozenset(["忽略建议", "dismiss kb", "/kb-dismiss"])
+_ADMIN_RESTART_CMDS = frozenset(["重启", "restart", "/restart"])
+
+# ── 上线抗压：并发闸门 + 单用户防刷（均可用环境变量关闭，秒级回滚）──
+# 瓶颈在 LLM 网关而非本地（向量/Reranker 走本地 mps）。无闸时多人涌入会让
+# 每条消息开一个裸线程直打网关 → 限流 → 集体"系统异常"。闸门限制同时在跑
+# 的 LLM 问答数，满员时立即给用户发一条可见的繁忙告知（而非干等）。
+_LLM_GATE_ENABLED = os.environ.get("HRBOT_GATE", "1") != "0"
+_LLM_GATE_MAX = int(os.environ.get("HRBOT_GATE_MAX", "12"))      # 同时在跑的问答上限（网关 16 并发无重试，留余量）
+_LLM_GATE_WAIT_S = float(os.environ.get("HRBOT_GATE_WAIT_S", "3"))  # 等闸最长秒数，超时即告知繁忙
+_llm_gate = threading.BoundedSemaphore(_LLM_GATE_MAX)
+
+# 单用户防刷：同一 open_id 间隔过短的重复提问直接告知，不打 LLM
+_ANTISPAM_ENABLED = os.environ.get("HRBOT_ANTISPAM", "1") != "0"
+_ANTISPAM_GAP_S = float(os.environ.get("HRBOT_ANTISPAM_GAP_S", "4"))  # 同一用户最小提问间隔
+_user_last_msg: dict[str, float] = {}
+_user_last_msg_lock = threading.Lock()
+
+_BUSY_MSG_ZH = "当前咨询人数较多，我这边有点忙不过来啦～请稍等几秒再发一次，我会尽快回复你 🙏"
+_BUSY_MSG_EN = ("Lots of questions coming in right now — I'm a bit busy. "
+                "Please resend in a few seconds and I'll get to you 🙏")
 
 _GREETINGS = {
     "hi","hello","你好","早","早上好","下午好","晚上好","嗨","hey","哈喽","早安","晚安",
     "good morning","good afternoon","good evening",
     "在吗","在不在","有人吗","你在吗","你在不在",
 }
-# 打招呼词根：短消息里只要以这些开头，视为打招呼
 _GREETING_STEMS = ("你好", "嗨", "hi", "hey", "hello", "哈喽", "早上好", "下午好", "晚上好", "早安", "晚安", "good morning", "good afternoon", "good evening")
+_GREETING_SUFFIXES = {"", "呀", "啊", "哦", "啦", "喽", "哟", "呢", "哈", "there", "bot", "hr bot"}
 _BOT_INTRO_ZH = "你好呀 👋 我是公司 HR 助手～假期、报销、绩效、福利、入职……这些 HR 问题都可以问我，有什么需要帮忙的吗？"
 _BOT_INTRO_EN = "Hey there 👋 I'm the company HR assistant! Ask me anything about leave, expenses, performance, benefits, or onboarding — happy to help 😊"
 
@@ -164,22 +186,53 @@ except Exception as _e:
 # 文档级链接注册表：当某个 KB 文件被召回时，自动附加对应的主文档链接。
 # 用于解决"内容在内容文件，PDF 链接在索引文件"导致链接无法跟随内容推送的问题。
 _DOC_LINKS: dict[str, tuple[str, str]] = {}
-# kb_url_map.json 在 main() 启动时加载（log 初始化后）
+
+
+def _load_doc_links() -> int:
+    """加载文档级链接映射（kb_url_map.json）。
+
+    模块导入时即执行，保证任何以 `import bot` 方式调用 _curate_links 的场景
+    （测试脚本、离线验证）与生产 bot 行为一致——此前只在 main() 里加载，
+    导致测试环境 _DOC_LINKS 恒为空、机制一文档级链接完全失效。
+    幂等：重复调用只是覆盖同样的值。此处不打日志（log 尚未初始化），
+    由 main() 启动时统一汇报条数。
+    """
+    p = Path(__file__).parent / "kb_url_map.json"
+    if not p.exists():
+        return 0
+    try:
+        data: dict = json.loads(p.read_text(encoding="utf-8"))
+        for fname, info in data.items():
+            if isinstance(info, dict) and info.get("url"):
+                _DOC_LINKS[fname] = (info["label"], info["url"])
+    except Exception:
+        return 0
+    return len(_DOC_LINKS)
+
+
+_load_doc_links()
 
 _CHUNK_SOURCE_RE = re.compile(r'^\[来源:\s*([^|]+?)\s*\|')
 # 用于剥离 chunk header，取出实质内容做引用核查
 _CHUNK_HEADER_STRIP_RE = re.compile(r'^\[来源:[^\]]*\]\s*', re.MULTILINE)
-# 中文 8+字 或 英文 6+字 的连续片段，LLM "照抄" 原则下必然会在 reply 中原样出现
-# 英文 HR 常用词（leave/salary/annual/policy/benefits）最长 8 字，10+ 阈值会导致英文内容全部 miss
-_CITE_PHRASE_RE = re.compile(r'[一-鿿]{8,}|[a-zA-Z]{6,}')
+# Tier 1 精确匹配：4+ CJK 字或 6+ ASCII 字连续片段，覆盖逐字引用场景。
+# 改写型答案由 Tier 2（字 bigram 重叠率）兜底，故此阈值无需继续下调。
+_CITE_PHRASE_RE = re.compile(r'[一-鿿]{4,}|[a-zA-Z]{6,}')
+# 用于剥离 markdown 加粗/斜体，让 chunk 内容恢复连续中文以便匹配
+_CITE_MD_STRIP_RE = re.compile(r'\*{1,3}([^*\n]+?)\*{1,3}')
 
-# 话题级权威链接白名单：某些高频"交叉话题"的关键内容以样板文字形式散落在多个文档里，
-# 按文档级机制会一次推出一堆无关链接。对这类话题：查询命中时只推这一条权威链接，
-# 并抑制"因样板文字被召回"的文档级链接（不影响该话题以外的正常链接）。
-# 在 config.py 里配置 TOPIC_LINKS（格式见 config.example.py），默认为空（功能关闭）。
+# 话题级权威链接白名单：某些高频"交叉话题"的关键内容以样板文字形式散落在多个文档里
+# （例："勇敢说/Speakup"作为页脚出现在 8+ 个 KB 文件），按文档级机制会一次推出一堆
+# 无关链接。对这类话题：查询命中时只推这一条权威链接，并抑制"因样板文字被召回"的
+# 文档级链接（不影响该话题以外的正常链接）。
 # 注意：权威页可能位于"不抓取内容"的受限空间——此处仅作为跳转链接推给用户，
 #       绝不把该空间内容纳入本地 KB（受限空间仅作跳转链接，不抓内容）。
+# 在 config.py 里配置 TOPIC_LINKS（格式见 config.example.py），默认为空（功能关闭）。
 _TOPIC_LINKS: list[dict] = getattr(_config, "TOPIC_LINKS", [])
+
+# 冻结的 KB 文件清单（在 config.py 里配置 BLOCKED_KB_FILES，默认为空）：
+# 清单内文件的 chunk 不回答、不推链接（用于只作跳转、不抓内容的受限文档）。
+_BLOCKED_KB_FILES: set[str] = set(getattr(_config, "BLOCKED_KB_FILES", []))
 
 
 # 查询分词：ASCII 单词、数字串、CJK 连续串分别切出，避免把 "绩效培训资料"
@@ -201,6 +254,17 @@ def _query_terms(query: str) -> list[str]:
     return list(set(terms))
 
 
+def _extract_cjk_bigrams(text: str) -> set[str]:
+    """提取文本中所有 CJK 字符 bigram（2字滑动窗口），返回去重集合。
+    用于 _chunk_in_reply Tier 2 语义重叠检测——字 bigram 是中文最小语义单元，
+    天然抗 LLM 改写（措辞变化、插空格、删修饰词都不影响重叠率）。"""
+    cn_chars = re.findall(r'[一-鿿]', text)
+    bigrams = set()
+    for i in range(len(cn_chars) - 1):
+        bigrams.add(cn_chars[i] + cn_chars[i + 1])
+    return bigrams
+
+
 def _link_context_relevant(chunk: str, match_start: int, query: str) -> bool:
     """检查链接前后各 150 字范围内是否包含查询关键词。
     比原版（仅前150字）更宽松，比全文匹配更精准。"""
@@ -213,16 +277,57 @@ def _link_context_relevant(chunk: str, match_start: int, query: str) -> bool:
     return any(t in window for t in terms)
 
 
-def _chunk_in_reply(chunk: str, reply: str) -> bool:
-    """检查 chunk 的实质内容是否被 LLM 引用进了 reply。
-    中文 8+ 连续字、英文 6+ 连续字母。LLM 系统提示要求原文照抄，
-    被引用的 chunk 必然在 reply 里留下可识别片段。"""
+def _chunk_reply_score(chunk: str, reply: str) -> float:
+    """计算 chunk 与 reply 的 CJK bigram 重叠率（0~1），用于最佳链接候选选择。
+    复用 _chunk_in_reply 的 strip 逻辑；直接引用 chunk（Tier 1 命中）返回 1.0。"""
     content = _CHUNK_HEADER_STRIP_RE.sub("", chunk).strip()
+    content = _CITE_MD_STRIP_RE.sub(r"\1", content)
     reply_l = reply.lower()
-    for phrase in _CITE_PHRASE_RE.findall(content)[:40]:
+
+    # Tier 1 命中：精确匹配权重最高
+    for phrase in _CITE_PHRASE_RE.findall(content):
+        if phrase.lower() in reply_l:
+            return 1.0
+
+    # Tier 2: bigram 重叠率
+    chunk_bigrams = _extract_cjk_bigrams(content)
+    reply_bigrams = _extract_cjk_bigrams(reply)
+    if len(chunk_bigrams) < 5 or len(reply_bigrams) < 5:
+        return 0.0
+    overlap = chunk_bigrams & reply_bigrams
+    return len(overlap) / min(len(chunk_bigrams), len(reply_bigrams))
+
+
+def _chunk_in_reply(chunk: str, reply: str) -> bool:
+    """检查 chunk 实质内容是否被 LLM 引用进了 reply。
+
+    Tier 1（快速通道）：精确子串匹配——4+ CJK 字或 6+ ASCII 字连续出现。
+    覆盖逐字引用场景，零误匹配。
+
+    Tier 2（回退通道）：CJK 字 bigram 重叠率——提取 chunk 和 reply 中
+    所有 2 字 CJK 片段，要求绝对重叠 ≥15 且相对比例 ≥30%（用 min 做分母）。
+    双条件确保：短文本不会因巧合共现误匹配，长文本稀释后仍能捕获引用信号。"""
+    content = _CHUNK_HEADER_STRIP_RE.sub("", chunk).strip()
+    content = _CITE_MD_STRIP_RE.sub(r"\1", content)
+    reply_l = reply.lower()
+
+    # Tier 1: 精确子串匹配
+    for phrase in _CITE_PHRASE_RE.findall(content):
         if phrase.lower() in reply_l:
             return True
-    return False
+
+    # Tier 2: CJK 字 bigram 重叠率（改写型答案回退）
+    # 双条件：绝对重叠 ≥15 + 相对比例 ≥30%。绝对数防短文本巧合，
+    # 比例防长文本中随机共现 bigram 被误判为引用。
+    chunk_bigrams = _extract_cjk_bigrams(content)
+    if len(chunk_bigrams) < 10:
+        return False
+    reply_bigrams = _extract_cjk_bigrams(reply)
+    if len(reply_bigrams) < 10:
+        return False
+    overlap = chunk_bigrams & reply_bigrams
+    ratio = len(overlap) / min(len(chunk_bigrams), len(reply_bigrams))
+    return len(overlap) >= 15 and ratio >= 0.30
 
 
 # PDF/PPT/PPTX 等附件文件 stub 标记：这类文件内容无法解析，KB 里只存链接占位符。
@@ -245,7 +350,9 @@ def _curate_links(contexts: list[str], query: str = "",
       ① reranker 分数下限（< 0.05 全跳）；
       ② topic guard（大全文档只在主题查询时推）；
       ③ _chunk_in_reply（LLM 真正引用才推）；stub 附件文件+文件名相关，或高分(>0.5)+文件名相关时可绕过③；
-      ④ 文件名相关性过滤（max_score > 0 时只留匹配文件；= 0 时只留分最高的一篇）。
+      ④ 文件名相关性过滤（有文件名匹配时只留匹配的文件）；
+      ⑤ 多来源全推：同一段内容被多篇文档收录时，同级引用的链接全部推送（上限 4 条），
+         不替用户挑唯一出处；无验证引用时才退化为只推最高分一篇。
     机制二（内联级，辅）：扫 top-2 chunks 正文里的跨文档超链接；source chunk 须通过
       _chunk_in_reply；链接上下文须含查询词；topic guard 同样适用。
     统一过滤死链（_DEAD_URLS）与重复（按 URL 和标题去重）。"""
@@ -269,8 +376,8 @@ def _curate_links(contexts: list[str], query: str = "",
 
     # 机制零：话题级权威链接白名单（最高优先，命中即独占）
     # 命中高频交叉话题时，只推这一条/几条权威链接，并完全跳过文档级/内联链接。
-    # 原因：这类话题的关键词会以样板页脚、或语义相近（举报↔保密/密级、
-    # 监督↔新员工规范）的方式召回一堆无关文档，按文档级机制会
+    # 原因：这类话题（如"勇敢说/Speakup"）的关键词会以样板页脚、或语义相近
+    # （举报↔保密/密级、监督↔新员工规范）的方式召回一堆无关文档，按文档级机制会
     # 把它们的链接一起刷出去。对这些话题，权威链接就是唯一正确答案，其余一律不推。
     q_lower = query.lower()
     matched_topics = [t for t in _TOPIC_LINKS
@@ -287,17 +394,44 @@ def _curate_links(contexts: list[str], query: str = "",
     # ② topic guard：新员工指引是"大全文档"，嵌入了 绩效/团建/福利 等内容，
     #    非入职类查询不推其链接，避免乱入。
     # ③ 文件名相关性：对所有通过①②的候选，优先推文件名与查询关键词匹配的文件。
-    # 扫描范围：top-3（而非 top-2），让真正的专项文档有机会被发现（避免被
-    # 大全文档占满 top-2 而挤出去）。
+    # 扫描范围：top-5，确保 evaluator 能判对的答案（可能引用 top-4/5 的 chunk）
+    # 也能推送到链接。_chunk_in_reply + topic guard 会过滤无关候选，不会多推。
 
     # 新员工大全文档的 topic guard：只有入职相关查询才推其链接
     _NJ_FNAMES = {"新员工入职快速指引.md", "New Joiner Online Training Guide.md"}
     _NJ_KEYWORDS = ["入职", "新员工", "onboard", "new joiner", "orientation",
                     "first day", "第一天", "试用期", "岗前"]
+    # 抑制词：查询含这些词说明用户真正关心的是其他政策，不是入职指引
+    _NJ_SUPPRESS = ["绩效", "年假", "工资", "薪资", "报销", "团建",
+                    "产假", "陪产假", "病假", "离职", "合同", "福利"]
 
     def _is_nj_query() -> bool:
         ql = query.lower()
-        return any(kw.lower() in ql for kw in _NJ_KEYWORDS)
+        has_nj = any(kw.lower() in ql for kw in _NJ_KEYWORDS)
+        has_other = any(kw.lower() in ql for kw in _NJ_SUPPRESS)
+        return has_nj and not has_other
+
+    # 宽泛通用文档 topic guard（在 config.py 里配置 BROAD_DOC_KWS：
+    # {文件名: (触发关键词, ...)}）。只在查询命中关键词时才推该文档链接，
+    # 避免"大全文档"在非相关查询里频繁刷链接。默认空 dict = 全部文档不管控。
+    _BROAD_DOC_KWS: dict[str, tuple] = getattr(_config, "BROAD_DOC_KWS", {})
+
+    def _is_broad_doc_allowed(fname: str) -> bool:
+        kws = _BROAD_DOC_KWS.get(fname)
+        if kws is None:
+            return True  # 未受管控的文件默认允许
+        ql = query.lower()
+        return any(kw.lower() in ql for kw in kws)
+
+    # URL → fname 反向映射（用于机制二 inline link 的宽泛文档 guard）
+    _url_to_fname_map: dict[str, str] = {url: fn for fn, (_, url) in _DOC_LINKS.items()}
+
+    # 宽泛 overview 查询 — LLM 按 Rule 12 只给指针不引用原文，
+    # 此时跳过 _chunk_in_reply，直接推所有相关文档链接
+    _OVERVIEW_PATTERNS = ["请查阅", "请参考", "Please refer", "See the "]
+
+    def _is_overview_reply() -> bool:
+        return len(reply) < 200 and any(p in reply for p in _OVERVIEW_PATTERNS)
 
     nj_allowed = _is_nj_query()
 
@@ -306,14 +440,16 @@ def _curate_links(contexts: list[str], query: str = "",
         fl = fname.lower()
         return sum(1 for t in terms if t in fl)
 
-    # 关卡①：reranker 分数下限——top 分太低说明 KB 无好答案，不推任何链接
-    top_score = max(scores[:3]) if scores and len(scores) >= 1 else 1.0
-    if top_score < 0.05:
-        log.info("[links] reranker top 分 %.3f < 0.05，跳过所有链接", top_score)
+    # 关卡①：reranker 分数下限——top 分太低说明 KB 无好答案，不推任何链接。
+    # scores 可能含 None（BM25 保护注入的未经 reranker 的 chunk），需先过滤。
+    _valid_scores = [s for s in scores[:3] if isinstance(s, (int, float))] if scores else []
+    top_score = max(_valid_scores) if _valid_scores else 1.0
+    if top_score < 0.01:
+        log.info("[links] reranker top 分 %.3f < 0.01，跳过所有链接", top_score)
         return links
 
-    candidates: list[tuple[str, tuple]] = []  # (fname, (label, url))
-    for i, ctx in enumerate(contexts[:3]):     # ← top-3 扫描，给专项文档机会
+    candidates: list[tuple[str, tuple, bool, float]] = []  # (fname, doc, is_cited, score)
+    for i, ctx in enumerate(contexts[:5]):     # ← top-5 扫描，覆盖 evaluator 判定范围内的 chunk
         m = _CHUNK_SOURCE_RE.match(ctx)
         if not m:
             continue
@@ -321,45 +457,81 @@ def _curate_links(contexts: list[str], query: str = "",
         doc = _DOC_LINKS.get(fname)
         if not doc:
             continue
+        # 冻结空间：不推冻结文件的链接
+        if fname in _BLOCKED_KB_FILES:
+            continue
         # 关卡②：topic guard
         if fname in _NJ_FNAMES and not nj_allowed:
             log.info("[links] topic guard（非入职查询），跳过新员工指引链接: %s", fname[:40])
             continue
+        if not _is_broad_doc_allowed(fname):
+            log.info("[links] topic guard（宽泛文档），跳过非相关查询: %s", fname[:40])
+            continue
         # 关卡③：_chunk_in_reply——以下情况绕过：
         #   a) stub 文件（PDF/PPT/PPTX 等附件，无实质内容可引用）且文件名相关
         #   b) 高分(>0.5) + 文件名相关（弥补 LLM 改写导致漏推）
+        #   c) 宽泛福利查询 + 福利手册（LLM 按规则只给指针不引用原文，需绕过）
         chunk_score = scores[i] if scores and i < len(scores) else 0.0
+        is_cited = True
         if reply and not _chunk_in_reply(ctx, reply):
             if _is_stub_chunk(ctx) and _fname_score(fname) > 0:
                 log.info("[links] stub 附件文件+文件名相关，跳过 _chunk_in_reply: %s", fname[:40])
-            elif chunk_score > 0.5 and _fname_score(fname) > 0:
+                is_cited = False
+            elif isinstance(chunk_score, (int, float)) and chunk_score > 0.5 and _fname_score(fname) > 0:
                 log.info("[links] 高分(%.2f)+文件名相关，绕过 _chunk_in_reply: %s",
                          chunk_score, fname[:40])
+                is_cited = False
+            elif _is_overview_reply() and _fname_score(fname) > 0:
+                log.info("[links] overview 指针回复+文件名相关，绕过 _chunk_in_reply: %s", fname[:40])
+                is_cited = False
             else:
                 log.info("[links] chunk 未被引用，跳过文档链接: %s", fname[:40])
                 continue
-        candidates.append((fname, doc))
+        # 计算候选匹配分：直接引用用 bigram 重叠率，绕过用 reranker 分数。
+        # chunk_score 可能为 None（kb.search 的 BM25 保护会注入未经 reranker 的
+        # chunk，分数记 None），不能直接与 0.5 比较，否则 TypeError。None 视为 0。
+        cs = chunk_score if isinstance(chunk_score, (int, float)) else 0.0
+        match_score = _chunk_reply_score(ctx, reply) if is_cited else cs * 0.3
+        candidates.append((fname, doc, is_cited, match_score))
 
     if candidates:
-        scored = [(fname, doc, _fname_score(fname)) for fname, doc in candidates]
-        max_score = max(s for _, _, s in scored)
-        if max_score > 0:
-            # 关卡④-a：有文件名相关的，只推匹配的
-            suppressed = [fn for fn, _, s in scored if s == 0]
+        # 关卡④：文件名相关性过滤
+        scored = [(fn, doc, cit, ms, _fname_score(fn)) for fn, doc, cit, ms in candidates]
+        max_fname = max(s for _, _, _, _, s in scored)
+        if max_fname > 0:
+            scored = [(fn, doc, cit, ms, fs) for fn, doc, cit, ms, fs in scored if fs > 0]
+            suppressed = [fn for fn, _, _, _ in candidates
+                          if _fname_score(fn) == 0]
             if suppressed:
                 log.info("[links] 文件名相关性过滤，跳过低相关文件: %s", suppressed)
-            candidates = [(fn, doc) for fn, doc, s in scored if s > 0]
-        else:
-            # 关卡④-b：无文件名相关的候选
-            # reranker 高度置信（>0.7）时，保留最高分 1 条——说明内容真实命中，
-            # 只是文件名（如"员工制度手册"）不含查询词（如"年假"），属于大全文档正常覆盖。
-            # 低分时（<0.7）说明匹配本就不确定，不推更稳。
-            if candidates and top_score > 0.7:
-                log.info("[links] 文件名无查询词但 reranker 高分 %.3f，保留最高分 1 条", top_score)
-                candidates = candidates[:1]
+
+        # 关卡⑤：多来源全推——KB 里同一段政策原文常被多篇文档逐字收录，
+        # 这些文档每一篇都是该答案的合法出处。此时应把涉及到的链接都推出去，
+        # 让用户自己选择打开哪一篇，而不是替用户挑一篇（挑错了用户就找不到原文）。
+        # 只丢弃明显弱于最佳候选的（相对门槛），并设上限避免刷屏。
+        _LINK_REL_FLOOR = 0.6   # 相对最佳候选的分数门槛，同级的都推
+        _LINK_MAX = 4           # 单次推送链接数上限
+        if len(scored) > 1:
+            # 优先保留直接引用（is_cited）的候选，它们才是回答真正用到的文档
+            cited = [(fn, doc, ms) for fn, doc, cit, ms, _ in scored if cit]
+            if cited:
+                best_ms = max(ms for _, _, ms in cited)
+                keep = sorted([c for c in cited if c[2] >= best_ms * _LINK_REL_FLOOR],
+                              key=lambda x: -x[2])[:_LINK_MAX]
+                log.info("[links] 多候选(%d)保留同级引用 %d 个: %s",
+                         len(scored), len(keep),
+                         [(fn[:24], round(ms, 2)) for fn, _, ms in keep])
+                candidates = [(fn, doc) for fn, doc, _ in keep]
             else:
-                log.info("[links] 所有候选文件名均不含查询词（top_score=%.3f），丢弃全部候选", top_score)
-                candidates = []
+                # 全是绕过候选（未验证引用），保守起见仍只推 reranker 分最高的一篇
+                best = max(scored, key=lambda x: x[3])
+                log.info("[links] 多候选(%d)无引用，选最高分绕过: %s (score=%.2f)",
+                         len(scored), best[0][:40], best[3])
+                candidates = [(best[0], best[1])]
+        else:
+            log.info("[links] 文件名无查询词但 chunk 已被引用，仅 %d 候选", len(scored))
+            candidates = [(fn, doc) for fn, doc, _, _, _ in scored]
+
         for fname, doc in candidates:
             _add(doc[0], doc[1])
 
@@ -367,6 +539,9 @@ def _curate_links(contexts: list[str], query: str = "",
     for ctx in contexts[:2]:
         src_m = _CHUNK_SOURCE_RE.match(ctx)
         ctx_fname = src_m.group(1).strip() if src_m else ""
+        # 冻结空间
+        if ctx_fname in _BLOCKED_KB_FILES:
+            continue
         # topic guard
         if ctx_fname in _NJ_FNAMES and not nj_allowed:
             log.info("[links] topic guard（机制二，非入职查询），跳过 NJ 内联链接: %s", ctx_fname[:40])
@@ -379,10 +554,44 @@ def _curate_links(contexts: list[str], query: str = "",
             label, url = m.group(1).strip(), m.group(2).strip()
             if "larksuite.com" not in url:
                 continue
+            # 机制二也需要过宽泛文档 guard：inline 链接的目标可能是联系人/手册等通用文档
+            _link_target_fname = _url_to_fname_map.get(url, "")
+            if _link_target_fname and not _is_broad_doc_allowed(_link_target_fname):
+                log.info("[links] 机制二：topic guard（宽泛文档），跳过 inline 链接: %s", _link_target_fname[:40])
+                continue
             if not _link_context_relevant(ctx, m.start(), query):
                 log.debug("[links] 跳过不相关内联链接: [%s] (query=%r)", label[:20], query[:20])
                 continue
             _add(label, url)
+
+    # 机制三：书名号指认——回答以"请查阅《XX》了解详情"这类指针收尾时，
+    # LLM 给的是《书名》而非 markdown 链接，机制一/二都扫不到。
+    # 这里把《...》里的标题映射回 _DOC_LINKS，补上目标文档链接，让员工能点开。
+    # 只做标题级匹配，不引入新内容，命中即推（这类答案本身就是"去看某文档"的意思）。
+    _BOOK_RE = re.compile(r'《([^》\n]{2,60})》')
+    _VERSION_RE = re.compile(r'[vV]\d+(?:\.\d+)*$|\s*（?20\d\d\s*年?版?）?$|\s*\(?(20\d\d)[^\d]*\)?\s*$')
+
+    def _norm_title(s: str) -> str:
+        s = re.sub(r'\.md\s*$', '', s, flags=re.I)
+        s = _VERSION_RE.sub('', s)
+        return re.sub(r'[\s（）()【】\-—_&＆|]', '', s).lower()
+
+    for raw in _BOOK_RE.findall(reply):
+        key = _norm_title(raw)
+        if not key:
+            continue
+        best_fname = None
+        for fname in _DOC_LINKS:
+            fk = _norm_title(fname)
+            if not fk:
+                continue
+            if fk == key or (len(key) >= 4 and (key in fk or fk in key)):
+                if best_fname is None or len(fk) < len(_norm_title(best_fname)):
+                    best_fname = fname
+        if best_fname and best_fname not in _BLOCKED_KB_FILES:
+            label, url = _DOC_LINKS[best_fname]
+            if _add(label, url):
+                log.info("[links] 书名号指认补充链接: 《%s》→ %s", raw[:24], best_fname[:40])
 
     log.info("[links] query=%r found=%d %s", query[:30], len(links),
              [(l[:20], u[-30:]) for l, u in links])
@@ -433,6 +642,16 @@ def _finalize_links(reply: str, links: list[tuple[str, str]], lang: str = "zh",
     return reply_clean
 
 
+def _is_greeting_only(query: str) -> bool:
+    q_clean = re.sub(r'[^\w\s一-鿿]', '', query).strip().lower()
+    if q_clean in _GREETINGS:
+        return True
+    for stem in sorted(_GREETING_STEMS, key=len, reverse=True):
+        if q_clean.startswith(stem) and q_clean[len(stem):].strip() in _GREETING_SUFFIXES:
+            return True
+    return False
+
+
 def _classify_social(q_clean: str) -> Optional[str]:
     """短社交消息分类，返回 'thanks'/'ack'/'compliment' 或 None。"""
     if len(q_clean) > 30:
@@ -459,7 +678,10 @@ def _strip_markdown(text: str) -> str:
             lines.append("  ".join(cells))
             continue
         line = re.sub(r"^#{1,6}\s+", "", line)
-        line = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", line)
+        # 卡片用 lark_md 渲染，保留 **加粗** 用于重点高亮（2026-07-31 用户要求）；
+        # 其余 markdown 记号仍全部剥掉：***x*** 降级为 **x**，斜体 *x* 去掉记号
+        line = re.sub(r"\*{3}([^*\n]+)\*{3}", r"**\1**", line)
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
         line = re.sub(r"_{1,2}([^_\n]+)_{1,2}", r"\1", line)
         line = re.sub(r"`([^`]*)`", r"\1", line)
         line = re.sub(r"^>\s*", "", line)
@@ -474,8 +696,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(
+        # 轮转：单文件 10MB × 3 个备份，防止全员上线后日志无限增长
+        logging.handlers.RotatingFileHandler(
             os.path.expanduser("~/.local/log/lark-hr-bot-dept.log"),
+            maxBytes=10 * 1024 * 1024, backupCount=3,
             encoding="utf-8",
         ),
     ],
@@ -485,6 +709,11 @@ logging.getLogger("lark_oapi").propagate = False
 log = logging.getLogger(__name__)
 
 _FAIL_EXIT_AFTER = 900
+# 工作时间熔断预算（秒）：WS 失败后留给 SDK 自动重连的时间。
+# SDK 重连间隔默认 ~120 秒（服务端下发），首次重试约 2~2.5 分钟；
+# 240 秒 = 给足首次重试的机会，仍未恢复就杀进程让 launchd 拉起全新连接，
+# 把工作时间最长断线从 15 分钟压到 ~4 分钟（2026-07-31 全量上线前收紧）。
+_FAIL_EXIT_AFTER_WORK = 240
 
 
 # WS 不稳定的几种已知错误特征串。之前只认 "NameResolutionError"（纯断网），
@@ -511,47 +740,103 @@ class _FailExitHandler(logging.Handler):
     def reset_failure(self) -> None:
         self._first_fail = None
 
+    def note_failure(self) -> None:
+        if self._first_fail is None:
+            self._first_fail = _time.time()
+
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
         is_ws_fail = ("connect failed" in msg or "receive message loop exit" in msg) \
             and any(p in msg for p in _WS_FAIL_PATTERNS)
         if is_ws_fail:
-            if self._first_fail is None:
-                self._first_fail = _time.time()
-            elif _time.time() - self._first_fail >= self._max:
+            if self._first_fail is not None and _time.time() - self._first_fail >= self._max:
                 log.warning("WS 持续异常超过 %.0f 分钟（进程内重连未能恢复），主动退出等待 launchd 重启",
                             self._max / 60)
                 os._exit(1)
+            self.note_failure()
 
 
 _fail_handler = None  # type: Optional[_FailExitHandler]
 
+
+def _on_ws_reconnecting() -> None:
+    # SDK 判定连接已丢、开始重试：立即记为故障起点。
+    # 不等错误日志匹配特征串——SDK 静默卡死时可能根本没有后续日志。
+    if _fail_handler:
+        _fail_handler.note_failure()
+
+
+def _on_ws_reconnected() -> None:
+    # SDK 重连成功：立即复位熔断。避免「SDK 已恢复、但一直没用户消息
+    # 触发 reset_failure」时健康进程被 _fail_timer 误杀。
+    log.info("WS 重连成功（SDK on_reconnected 钩子），熔断状态复位")
+    # 重连成功本身就是 WS 层存活证据，同步刷新 _last_ws_event。
+    # 否则周末/夜间无用户消息时，只要有一次未复位的小故障挂账，
+    # _fail_timer 就会因「超过预算无 WS 事件」误杀健康进程（2026-08-15/16
+    # 周末每天 3-4 次误报重启）。
+    global _last_ws_event
+    _last_ws_event = _time.time()
+    if _fail_handler:
+        _fail_handler.reset_failure()
+
 _OPENID_CACHE_TTL = 86400
 
-# qid → (question, answer_text, timestamp)  用于卡片点击时还原内容
-_card_store: dict = {}
-_CARD_STORE_TTL = 7200  # 2 小时
+# qid → (question, answer_text, ts, chat_id, lang)  用于卡片点击时还原内容。
+# 2026-07-31 改为 SQLite 持久化（原来存内存 dict，TTL 仅 2 小时）：
+# 用户可能隔天才回来点反馈按钮，且 bot 每次重启内存就清空，
+# 导致按钮"过期失效"。现在落盘 + 30 天有效，重启不丢。
+_CARD_STORE_TTL = 30 * 86400  # 30 天
+_CARD_DB = Path.home() / ".local" / "data" / "hr-bot-cards.db"
+
+
+def _card_db() -> "sqlite3.Connection":
+    _CARD_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_CARD_DB, timeout=10)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cards("
+        "qid TEXT PRIMARY KEY, question TEXT, answer TEXT,"
+        "ts REAL, chat_id TEXT, lang TEXT, docs TEXT)"
+    )
+    # 旧库缺 docs 列时补列（credit_store 反馈归因需要）
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(cards)").fetchall()]
+    if "docs" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN docs TEXT")
+    return conn
 
 
 def _card_store_put(qid: str, question: str, answer_text: str,
                     chat_id: str = "", lang: str = "zh",
                     contexts: Optional[list] = None) -> None:
-    # contexts 一并存档：用户点 👍/👎 时把反馈归因到当次引用的来源文档（信用加权）
-    docs = [credit_store.doc_of(c) for c in (contexts or [])]
-    _card_store[qid] = (question, answer_text, _time.time(), chat_id, lang, docs)
-    expired = [k for k, (_, _, ts, _, _, _) in _card_store.items()
-               if _time.time() - ts > _CARD_STORE_TTL]
-    for k in expired:
-        del _card_store[k]
+    docs = json.dumps([credit_store.doc_of(c) for c in (contexts or [])],
+                      ensure_ascii=False)
+    try:
+        with _card_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO cards VALUES(?,?,?,?,?,?,?)",
+                (qid, question, answer_text, _time.time(), chat_id, lang, docs),
+            )
+            conn.execute("DELETE FROM cards WHERE ts < ?",
+                         (_time.time() - _CARD_STORE_TTL,))
+    except Exception as e:
+        log.warning("卡片存储写入失败: %s", e)
 
 
 def _card_store_pop(qid: str) -> Optional[tuple]:
-    entry = _card_store.get(qid)
-    if entry:
-        q, a, ts, chat_id, lang, docs = entry
-        del _card_store[qid]
+    try:
+        with _card_db() as conn:
+            row = conn.execute(
+                "SELECT question, answer, ts, chat_id, lang, docs FROM cards WHERE qid=?",
+                (qid,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM cards WHERE qid=?", (qid,))
+        q, a, ts, chat_id, lang, docs_json = row
         if _time.time() - ts < _CARD_STORE_TTL:
+            docs = json.loads(docs_json or "[]")
             return q, a, chat_id, lang, docs
+    except Exception as e:
+        log.warning("卡片存储读取失败: %s", e)
     return None
 
 
@@ -586,11 +871,11 @@ def _lookup_open_id(name: str) -> Optional[str]:
             )
             return [l.strip().strip('"') for l in r.stdout.strip().splitlines() if l.strip()]
 
-        # Pass 1: exact localized_name match (e.g. "john.smith" in "John.smith")
+        # Pass 1: exact localized_name match (e.g. "tommy.tang" in "Tommy.tang")
         lines = _search(keyword, f'.data.users[] | select((.localized_name | ascii_downcase | contains("{name_safe}")) and .is_cross_tenant == false and .is_activated == true) | .open_id')
         open_id = lines[0] if lines else None
 
-        # Pass 2: prefix match — handles shortened handles like "john.s" when searching "john.smith"
+        # Pass 2: prefix match — handles shortened handles like "Joen.w" when searching "joen.wang"
         if not open_id:
             keyword_safe = re.sub(r'[^a-z0-9]', '', keyword.lower())
             gap2 = _LARK_API_MIN_INTERVAL - (_time.time() - _last_lark_api_call)
@@ -611,15 +896,65 @@ def _lookup_open_id(name: str) -> Optional[str]:
 # 清新风格：浅色 header 色带 + 干净分区（正文 / 链接 / 反馈 / 免责声明），
 # 免责声明从正文里拆出来单独用小字 footer 呈现，高风险提示保留加粗单独醒目展示。
 
-_CARD_HEADER_ANSWER   = "turquoise"  # 薄荷绿，日常回答（主色调）
+_CARD_HEADER_ANSWER   = "yellow"     # 浅黄，日常回答（主色调，2026-07-31 用户指定）
 _CARD_HEADER_HEALED   = "green"      # 深一点的绿，跟「知识库已更新」的积极状态呼应
-_CARD_HEADER_STREAM   = "grey"       # 灰，生成中的中间态
+_CARD_HEADER_STREAM   = "yellow"     # 生成中的中间态，与主卡片色调一致
 _CARD_HEADER_POSITIVE = "green"      # 用户反馈「有帮助/满意」后
-_CARD_HEADER_NEUTRAL  = "turquoise"  # 用户反馈「没帮到/不满意」后，跟主卡片薄荷绿保持一致，不刺眼
+_CARD_HEADER_NEUTRAL  = "yellow"     # 用户反馈「没帮到/不满意」后，跟主卡片浅黄保持一致
 
 
-def _card_header(title: str, template: str) -> dict:
-    return {"template": template, "title": {"tag": "plain_text", "content": title}}
+def _card20_header(title: str, template: str, subtitle: str = "") -> dict:
+    """卡片 2.0 头部：标题 + 副标题 + 色板（色板仅官方 12 色，不支持自定义/渐变）。"""
+    h = {"template": template, "title": {"tag": "plain_text", "content": title}}
+    if subtitle:
+        h["subtitle"] = {"tag": "plain_text", "content": subtitle}
+    return h
+
+
+def _card20(header: dict, elements: list) -> dict:
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": header,
+        "body": {"elements": elements},
+    }
+
+
+def _btn20(text: str, qid: str, action: str, style: str = "default") -> dict:
+    """卡片 2.0 按钮：回调通过 behaviors 传递（服务端会映射到 event.action.value）。"""
+    b = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "size": "tiny",
+        "behaviors": [{"type": "callback", "value": {"action": action, "qid": qid}}],
+    }
+    if style != "default":
+        b["type"] = style
+    return b
+
+
+def _btnrow20(*btns: dict) -> dict:
+    """2.0 不支持 action/note 容器，按钮放进 column_set 分栏。"""
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "small",
+        "columns": [
+            {"tag": "column", "width": "auto", "elements": [b]} for b in btns
+        ],
+    }
+
+
+def _ask_line(text: str) -> dict:
+    return {"tag": "div", "text": {"tag": "lark_md", "content": f"💛 {text}"}}
+
+
+def _disclaimer_element(disclaimer: str) -> dict:
+    """免责声明行：2.0 无 note/standard_icon，统一用 div lark_md。"""
+    if "**" in disclaimer:
+        return {"tag": "div", "text": {"tag": "lark_md", "content": disclaimer}}
+    text = disclaimer.lstrip("⚠️").strip()
+    return {"tag": "div", "text": {"tag": "lark_md", "content": f"ℹ️ {text}"}}
 
 
 def _split_disclaimer(text: str) -> tuple[str, Optional[str]]:
@@ -632,28 +967,6 @@ def _split_disclaimer(text: str) -> tuple[str, Optional[str]]:
     return text, None
 
 
-def _icon_note(text: str, icon_token: str, color: str = "grey") -> dict:
-    """带图标的 note footer（icon + 灰字），比纯文字更有质感——
-    这是 Notion/Linear/ChatGPT 这类产品做「次要信息」时的通用模式：
-    用一个小图标代替 emoji，视觉上更统一、更克制。
-    仅用 standard_icon，是经典卡片 JSON 1.0 原生支持的组件，无版本兼容风险。"""
-    return {
-        "tag": "note",
-        "elements": [
-            {"tag": "standard_icon", "token": icon_token, "color": color},
-            {"tag": "plain_text", "content": text},
-        ],
-    }
-
-
-def _disclaimer_element(disclaimer: str) -> dict:
-    """普通免责声明 → 带图标的灰色小字 footer；含加粗的高风险警示 → 保留醒目 div。"""
-    if "**" in disclaimer:
-        return {"tag": "div", "text": {"tag": "lark_md", "content": disclaimer}}
-    text = disclaimer.lstrip("⚠️").strip()
-    return _icon_note(text, "info_outlined")
-
-
 def _resolve_mentions_for_card(text: str) -> str:
     """把 <<联系:Name>> 转成 lark_md @mention 格式 <at id="open_id"></at>。"""
     def replace(m):
@@ -663,53 +976,59 @@ def _resolve_mentions_for_card(text: str) -> str:
     return re.sub(r"<<联系:([^>]+)>>", replace, text)
 
 
+_sender_name_cache: dict[str, str] = {}
+
+
+def _lookup_sender_name(open_id: str) -> str:
+    """用 bot 自家 SDK 把事件里的 open_id 解析成显示名（带缓存）。
+
+    open_id 是 app 级隔离的，lark-cli 通道查会报 cross app，必须在进程内查。
+    失败时退回 open_id 尾 8 位，保证不同人仍可区分。"""
+    if not open_id or _sdk_client is None:
+        return ""
+    if open_id in _sender_name_cache:
+        return _sender_name_cache[open_id]
+    name = ""
+    try:
+        from lark_oapi.api.contact.v3 import GetUserRequest
+        req = GetUserRequest.builder().user_id(open_id).user_id_type("open_id").build()
+        resp = _sdk_client.contact.v3.user.get(req)
+        if resp.success() and resp.data and resp.data.user:
+            name = resp.data.user.name or ""
+    except Exception as e:
+        log.warning("提问人姓名解析失败: %s", e)
+    _sender_name_cache[open_id] = name or open_id[-8:]
+    return _sender_name_cache[open_id]
+
+
 def _build_answer_card(display_text: str, qid: str, lang: str = "zh") -> dict:
-    """构建带「有帮助/没帮助」按钮的答案卡片（清新蓝风格）。"""
+    """构建带「有帮助/没帮助」按钮的答案卡片（2.0，黄色头部）。"""
     if lang == "en":
-        note_text = "Was this helpful?"
+        ask_text = "Was this helpful?"
         btn_yes = "👍 Helpful"
         btn_no  = "👎 Not quite"
         title   = "💬 HR Assistant"
+        subtitle = "HR Knowledge Base"
     else:
-        note_text = "这个回答有帮到你吗？"
+        ask_text = "这个回答有帮到你吗？"
         btn_yes = "👍 有帮助"
         btn_no  = "👎 没太帮到"
         title   = "💬 HR 小助手"
+        subtitle = "HR 知识库"
 
     body, disclaimer = _split_disclaimer(display_text)
     elements = [
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": body},
-        },
+        {"tag": "markdown", "content": body},
         {"tag": "hr"},
-        _icon_note(note_text, "like_outlined"),
-        {
-            "tag": "action",
-            "actions": [
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_yes},
-                    "type": "primary",
-                    "size": "tiny",
-                    "value": {"action": "helpful", "qid": qid},
-                },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_no},
-                    "size": "tiny",
-                    "value": {"action": "not_helpful", "qid": qid},
-                },
-            ],
-        },
+        _ask_line(ask_text),
+        _btnrow20(
+            _btn20(btn_yes, qid, "helpful", "primary"),
+            _btn20(btn_no, qid, "not_helpful"),
+        ),
     ]
     if disclaimer:
         elements.append(_disclaimer_element(disclaimer))
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": _card_header(title, _CARD_HEADER_ANSWER),
-        "elements": elements,
-    }
+    return _card20(_card20_header(title, _CARD_HEADER_ANSWER, subtitle), elements)
 
 
 def _build_thanked_card(display_text: str, action: str, lang: str = "zh") -> dict:
@@ -734,29 +1053,22 @@ def _build_thanked_card(display_text: str, action: str, lang: str = "zh") -> dic
         "zh": {"helpful": "✅ 感谢反馈", "satisfied": "✅ 感谢反馈",
                "not_helpful": "📝 已记录", "still_not_helpful": "📝 已记录"},
     }
-    # 图标+颜色跟随语义：满意 → 打勾/绿色；未满意 → 编辑中/灰色（暗示「正在改进」而非「到此为止」）
-    _icon = "done_outlined" if action in ("helpful", "satisfied") else "edit_outlined"
-    _icon_color = "green" if action in ("helpful", "satisfied") else "grey"
+    # 图标+颜色跟随语义：满意 → 打勾/绿色；未满意 → 记录/黄色（暗示「正在改进」而非「到此为止」）
+    _icon_emoji = "✅" if action in ("helpful", "satisfied") else "📝"
     note = _notes.get(lang, _notes["zh"]).get(action, "感谢反馈！")
     title = _titles.get(lang, _titles["zh"]).get(action, "✅ 感谢反馈")
+    subtitle = "HR Knowledge Base" if lang == "en" else "HR 知识库"
     template = _CARD_HEADER_POSITIVE if action in ("helpful", "satisfied") else _CARD_HEADER_NEUTRAL
 
     body, disclaimer = _split_disclaimer(display_text)
     elements = [
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": body},
-        },
+        {"tag": "markdown", "content": body},
         {"tag": "hr"},
-        _icon_note(note, _icon, _icon_color),
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"{_icon_emoji} {note}"}},
     ]
     if disclaimer:
         elements.append(_disclaimer_element(disclaimer))
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": _card_header(title, template),
-        "elements": elements,
-    }
+    return _card20(_card20_header(title, template, subtitle), elements)
 
 
 def _build_healed_card(display_text: str, qid: str, lang: str = "zh") -> dict:
@@ -774,37 +1086,18 @@ def _build_healed_card(display_text: str, qid: str, lang: str = "zh") -> dict:
 
     body, disclaimer = _split_disclaimer(display_text)
     elements = [
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": body},
-        },
+        {"tag": "markdown", "content": body},
         {"tag": "hr"},
-        _icon_note(note_txt, "like_outlined"),
-        {
-            "tag": "action",
-            "actions": [
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_yes},
-                    "type": "primary",
-                    "value": {"action": "satisfied", "qid": qid},
-                },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_no},
-                    "type": "danger",
-                    "value": {"action": "still_not_helpful", "qid": qid},
-                },
-            ],
-        },
+        _ask_line(note_txt),
+        _btnrow20(
+            _btn20(btn_yes, qid, "satisfied", "primary"),
+            _btn20(btn_no, qid, "still_not_helpful", "danger"),
+        ),
     ]
     if disclaimer:
         elements.append(_disclaimer_element(disclaimer))
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": _card_header(title, _CARD_HEADER_HEALED),
-        "elements": elements,
-    }
+    subtitle = "HR Knowledge Base" if lang == "en" else "HR 知识库"
+    return _card20(_card20_header(title, _CARD_HEADER_HEALED, subtitle), elements)
 
 
 # ── 消息发送 ──────────────────────────────────────────────────────────────────
@@ -865,14 +1158,11 @@ def _patch_card(message_id: str, card: dict) -> bool:
 
 
 def _build_streaming_card(text: str, cursor: bool = True) -> dict:
-    """构建流式中间卡片（灰色 header，无按钮，生成完毕后会被答案卡片替换）。"""
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": _card_header("💬 …", _CARD_HEADER_STREAM),
-        "elements": [{"tag": "div", "text": {"tag": "lark_md",
-                       "content": text + (" ▌" if cursor else "")}}],
-    }
-
+    """构建流式中间卡片（2.0 黄色 header，无按钮，生成完毕后会被答案卡片替换）。"""
+    return _card20(
+        _card20_header("💬 …", _CARD_HEADER_STREAM),
+        [{"tag": "markdown", "content": text + (" ▌" if cursor else "")}],
+    )
 
 
 def _apply_confidence_gate(reply_text: str, contexts: list, lang: str) -> str:
@@ -896,6 +1186,7 @@ def _apply_confidence_gate(reply_text: str, contexts: list, lang: str) -> str:
             else "\n\n⚠️ 注意：以上部分内容未能完全对应知识库原文，请以实际政策文件或 HR 团队确认为准。")
     return reply_text + note
 
+
 def _stream_reply(query: str, contexts: list, history: list, lang: str,
                   chat_id: str, sender_id: str, t_start: float, t_kb: float,
                   scores: list = None) -> None:
@@ -918,7 +1209,15 @@ def _stream_reply(query: str, contexts: list, history: list, lang: str,
         _card_store_put(qid, query, display, chat_id, lang, contexts)
         _send_interactive(_build_answer_card(display, qid, lang), chat_id)
         # _cache_put 已关闭
-        question_log.log_question(query, len(contexts), reply_text)
+        question_log.log_question(query, len(contexts), reply_text, sender=_lookup_sender_name(sender_id),
+                                  unanswered=False if is_guard_query(query) else None)
+        if not is_guard_query(query) and question_log.is_unanswered_reply(len(contexts), reply_text):
+            try:
+                question_log.notify_unanswered(query, reply_text,
+                                               user_open_id=sender_id,
+                                               user_name=_lookup_sender_name(sender_id))
+            except Exception as _e:
+                log.warning("未解答通知失败: %s", _e)
         _update_history(chat_id, sender_id, query, reply_text)
         return
 
@@ -959,14 +1258,17 @@ def _stream_reply(query: str, contexts: list, history: list, lang: str,
         log.warning("最终 patch 失败，发送新卡片兜底")
         _send_interactive(_build_answer_card(display_text, qid, lang), chat_id)
 
-    _cache_put(query, reply_text)
-    question_log.log_question(query, len(contexts), reply_text)
-    # 有意义的问题但 KB 完全没命中 → 立即通知 HR，无需等日报
-    if not contexts and not is_guard_query(query):
+    # _cache_put 已关闭（读取端 _cache_get 从未启用，只写不读会让缓存文件无限增长）
+    question_log.log_question(query, len(contexts), reply_text, sender=_lookup_sender_name(sender_id),
+                              unanswered=False if is_guard_query(query) else None)
+    # KB 未覆盖（0 命中或兜底话术）→ 立即把问题+提问人通知 HR，无需等日报
+    if not is_guard_query(query) and question_log.is_unanswered_reply(len(contexts), reply_text):
         try:
-            question_log.notify_not_helpful(query, reply_text[:200])
+            question_log.notify_unanswered(query, reply_text,
+                                           user_open_id=sender_id,
+                                           user_name=_lookup_sender_name(sender_id))
         except Exception as _e:
-            log.warning("无命中通知失败: %s", _e)
+            log.warning("未解答通知失败: %s", _e)
     _update_history(chat_id, sender_id, query, reply_text)
 
 
@@ -1053,6 +1355,8 @@ def _heal_and_resend(chat_id: str, query: str, lang: str) -> None:
 
 # ── 卡片按钮回调 ──────────────────────────────────────────────────────────────
 
+
+
 def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     resp = P2CardActionTriggerResponse()
     try:
@@ -1067,13 +1371,19 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         lang_stored    = stored[3] if stored else "zh"
         source_docs    = stored[4] if stored else []
 
-        # 信用归因：👍/👎 映射为布尔后累计到来源文档（satisfied/still_not_helpful 同理）
+        # 反馈信用归因：把按钮反馈记到该回答实际引用过的文档上
         _credit_map = {"helpful": True, "not_helpful": False,
                        "satisfied": True, "still_not_helpful": False}
         if action in _credit_map and source_docs:
-            credit_store.record_feedback(source_docs, _credit_map[action])
+            try:
+                credit_store.record_feedback(source_docs, _credit_map[action])
+            except Exception as _e:
+                log.warning("[credit] 反馈记录失败: %s", _e)
 
-        question_log.log_feedback(action, question, answer_text[:200])
+        operator_open_id0 = (data.event.operator.open_id
+                             if data.event and data.event.operator else "")
+        question_log.log_feedback(action, question, answer_text[:200],
+                                  sender=_lookup_sender_name(operator_open_id0))
 
         toast = CallBackToast()
 
@@ -1083,11 +1393,19 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
         elif action == "not_helpful":
             toast.type = "info"
-            toast.content = (
-                "正在为你重新检索，稍后会在这里发新回答～"
-                if lang_stored == "zh"
-                else "Searching for a better answer — I'll post it here shortly."
-            )
+            if stored:
+                toast.content = (
+                    "正在为你重新检索，稍后会在这里发新回答～"
+                    if lang_stored == "zh"
+                    else "Searching for a better answer — I'll post it here shortly."
+                )
+            else:
+                # 30 天外或已消费过的旧卡片：别假装在重新检索，引导用户重新提问
+                toast.content = (
+                    "这条回答时间太久，无法再补充回答了，把问题重新发我一次吧～"
+                    if lang_stored == "zh"
+                    else "This answer is too old to improve — please send your question again."
+                )
             operator_open_id = (data.event.operator.open_id
                                 if data.event and data.event.operator else "")
             if chat_id_stored and question:
@@ -1098,14 +1416,16 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 ).start()
                 # 无论自愈是否成功，立即通知 HR，让 HR 知道有人觉得回答没帮到
                 try:
-                    question_log.notify_not_helpful(question, answer_text[:200],
-                                                    user_open_id=operator_open_id)
+                    question_log.notify_not_helpful(question, answer_text,
+                                                    user_open_id=operator_open_id,
+                                                    user_name=_lookup_sender_name(operator_open_id))
                 except Exception as e:
                     log.warning("发送 not_helpful 通知失败: %s", e)
             elif question:
                 try:
-                    question_log.notify_not_helpful(question, answer_text[:200],
-                                                    user_open_id=operator_open_id)
+                    question_log.notify_not_helpful(question, answer_text,
+                                                    user_open_id=operator_open_id,
+                                                    user_name=_lookup_sender_name(operator_open_id))
                 except Exception as e:
                     log.warning("发送 not_helpful 通知失败: %s", e)
 
@@ -1124,8 +1444,9 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 operator_open_id = (data.event.operator.open_id
                                     if data.event and data.event.operator else "")
                 try:
-                    question_log.notify_not_helpful(question, answer_text[:200],
-                                                    user_open_id=operator_open_id)
+                    question_log.notify_not_helpful(question, answer_text,
+                                                    user_open_id=operator_open_id,
+                                                    user_name=_lookup_sender_name(operator_open_id))
                 except Exception as e:
                     log.warning("发送 still_not_helpful 通知失败: %s", e)
 
@@ -1184,6 +1505,7 @@ def _extract_text(message) -> str:
 
 
 _processed: dict[str, float] = {}
+_last_ws_event: float = _time.time()  # WS 僵尸态检测：上次收到 WS 事件的时间
 _PROCESSED_TTL = 3600
 
 _history: dict = {}
@@ -1362,8 +1684,44 @@ def _handle_message(msg, sender, query: str, lang: str) -> None:
         scored = search(query, history=history, with_scores=True)
         contexts = [c for _, c in scored]
         scores   = [s for s, _ in scored]
+
+        # NJ 降噪：非入职查询排除新员工大全文档的 chunks，防止 NJ 吸走所有检索结果
+        _NJ_NOISE_FILES = {"新员工入职快速指引.md", "New Joiner Online Training Guide.md"}
+        _NJ_NOISE_KEYWORDS = {"入职", "新员工", "onboard", "new joiner", "orientation",
+                              "first day", "第一天", "试用期", "岗前", "转正"}
+        if not any(kw in query.lower() for kw in _NJ_NOISE_KEYWORDS):
+            filtered = [(s, c) for s, c in zip(scores, contexts)
+                        if not any(c.startswith(f"[来源: {njf}") for njf in _NJ_NOISE_FILES)]
+            if filtered and len(filtered) >= 2:  # 至少保留2条，避免过滤过猛
+                old_n = len(contexts)
+                scores = [s for s, _ in filtered]
+                contexts = [c for _, c in filtered]
+                if len(contexts) < old_n:
+                    log.info("NJ降噪: %d → %d chunks（排除新员工大全文档）", old_n, len(contexts))
+            else:
+                log.debug("NJ降噪跳过: 过滤后仅剩 %d 条，保留原结果", len(filtered))
+
         t_kb = _time.time() - t0_kb
         log.info("命中 %d 个知识库段落 [kb=%.2fs]", len(contexts), t_kb)
+
+        # 冻结空间检查：top-5 中有冻结文件且分高 → 拒绝回答
+        if contexts and scores:
+            for i in range(min(len(contexts), 5)):
+                if scores[i] is None:
+                    continue  # reranker 分数不可用，无法判定，跳过
+                if scores[i] < 0.5:
+                    break  # 后面的分更低，不可能触发
+                m = _CHUNK_SOURCE_RE.match(contexts[i])
+                if m and m.group(1).strip() in _BLOCKED_KB_FILES:
+                    refuse = ("This topic is outside my scope — please reach out to the relevant department for assistance."
+                              if lang == "en"
+                              else "这个问题不在我的知识范围内，暂时无法回答～建议你联系相关部门或查阅相关制度文档。")
+                    log.info("冻结空间拒绝: score=%.3f rank=%d file=%s", scores[i], i + 1, m.group(1).strip()[:40])
+                    _send_reply_text(refuse, msg.chat_id)
+                    _remove_reaction(msg.message_id, reaction_id)
+                    question_log.log_question(query, len(contexts), refuse, sender=_lookup_sender_name(sender_id))
+                    _update_history(msg.chat_id, sender_id, query, refuse)
+                    return
 
         # 模糊短查询 + 0 命中 + 意图不明 → 追问澄清；意图明确但 KB 无内容则走兜底
         if needs_clarification(query, len(contexts)) and not has_intent(query):
@@ -1371,7 +1729,7 @@ def _handle_message(msg, sender, query: str, lang: str) -> None:
             log.info("触发澄清追问: %s", clarify_q[:60])
             _send_reply_text(clarify_q, msg.chat_id)
             # 澄清追问是正常流程，不标记为未解答（传 kb_hits=1 跳过 unanswered 标记）
-            question_log.log_question(query, max(1, len(contexts)), clarify_q)
+            question_log.log_question(query, max(1, len(contexts)), clarify_q, sender=_lookup_sender_name(sender_id))
             _update_history(msg.chat_id, sender_id, query, clarify_q)
             return
 
@@ -1395,11 +1753,17 @@ def _handle_message(msg, sender, query: str, lang: str) -> None:
 
 
 def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
+    global _last_ws_event
+    _last_ws_event = _time.time()
+
     msg    = data.event.message
     sender = data.event.sender
 
-    if sender.sender_type == "app":
+    # 群消息一律不回复：bot 在群里只承担定时推送，不做问答（可按需删除此段放开群问答）
+    if getattr(msg, "chat_type", "") == "group":
+        log.info("群消息忽略 (chat_id=%s)", getattr(msg, "chat_id", ""))
         return
+
     if msg.message_id in _processed:
         return
     _processed[msg.message_id] = _time.time()
@@ -1491,12 +1855,16 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         )
         return
 
+    # 管理员命令：重启 Bot（仅管理员可触发）
+    if sender_id == _ADMIN_OPEN_ID and query.strip().lower() in _ADMIN_RESTART_CMDS:
+        _send_reply_text("♻️ 正在重启 Bot，请稍候（约5秒后恢复）...", msg.chat_id)
+        _time.sleep(0.5)
+        os._exit(0)
+        return
+
     # 打招呼 / 社交类短消息，同步快速回应，不走 KB
     q_clean = re.sub(r'[^\w\s一-鿿]', '', query).strip().lower()
-    is_greeting = q_clean in _GREETINGS or (
-        len(q_clean) <= 12 and any(q_clean.startswith(s) for s in _GREETING_STEMS)
-    )
-    if is_greeting:
+    if _is_greeting_only(q_clean):
         _send_reply_text(_BOT_INTRO_EN if lang == "en" else _BOT_INTRO_ZH, msg.chat_id)
         return
     social = _classify_social(q_clean)
@@ -1510,10 +1878,34 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         _send_reply_text(reply, msg.chat_id)
         return
 
+    # 单用户防刷：同一用户过密提问，第二条起告知，不打 LLM（防有人连发刷爆网关）
+    if _ANTISPAM_ENABLED and sender_id != _ADMIN_OPEN_ID:
+        now = _time.time()
+        with _user_last_msg_lock:
+            last = _user_last_msg.get(sender_id, 0.0)
+            if now - last < _ANTISPAM_GAP_S:
+                log.info("[antispam] %s 间隔 %.1fs < %.1fs，告知稍候", sender_id[-8:], now - last, _ANTISPAM_GAP_S)
+                _send_reply_text(_BUSY_MSG_EN if lang == "en" else _BUSY_MSG_ZH, msg.chat_id)
+                return
+            _user_last_msg[sender_id] = now
+
+    # 并发闸门：满员且短时等不到 → 立即发可见的繁忙告知，不排队干等
+    if _LLM_GATE_ENABLED and not _llm_gate.acquire(timeout=_LLM_GATE_WAIT_S):
+        log.warning("[gate] 满员(%d)等待 %.1fs 超时，告知繁忙: %s",
+                    _LLM_GATE_MAX, _LLM_GATE_WAIT_S, query[:24])
+        _send_reply_text(_BUSY_MSG_EN if lang == "en" else _BUSY_MSG_ZH, msg.chat_id)
+        return
+
     # LLM 工作：dispatch 到后台线程，避免阻塞事件处理
+    def _run_with_gate():
+        try:
+            _handle_message(msg, sender, query, lang)
+        finally:
+            if _LLM_GATE_ENABLED:
+                _llm_gate.release()
+
     threading.Thread(
-        target=_handle_message,
-        args=(msg, sender, query, lang),
+        target=_run_with_gate,
         daemon=True,
     ).start()
 
@@ -1591,16 +1983,10 @@ def main():
     import kb as _kb_mod
     _kb_mod.mark_fresh()
 
-    # 加载文档级链接（kb_url_map.json）
-    _url_map_path = Path(__file__).parent / "kb_url_map.json"
-    if _url_map_path.exists():
-        try:
-            _url_map_data: dict = json.loads(_url_map_path.read_text(encoding="utf-8"))
-            for _fname, _info in _url_map_data.items():
-                _DOC_LINKS[_fname] = (_info["label"], _info["url"])
-            log.info("已加载 %d 条文档级链接", len(_DOC_LINKS))
-        except Exception as _e:
-            log.warning("加载 kb_url_map.json 失败: %s", _e)
+    # 文档级链接（kb_url_map.json）已在模块导入时加载，这里只汇报/兜底重载
+    if not _DOC_LINKS:
+        _load_doc_links()
+    log.info("已加载 %d 条文档级链接", len(_DOC_LINKS))
 
     _cache_load()            # 从文件恢复答案缓存
     _init_lark_sdk()         # 延迟导入 lark_oapi，建立 SDK 客户端
@@ -1631,18 +2017,17 @@ def main():
     # 补一个独立计时线程：一旦出现失败且超过预算时间没有成功复位
     # （reset_failure），直接退出进程，不依赖新日志到达。
     # 预算按用户作息分档（2026-07-27 确认：工作日 9-10 点开盖、18-19 点合盖即睡眠，
-    # 节假日不开盖）：
-    #   - 工作时间（周一~周五 08:00-19:59）：900 秒，尽快自愈，保证员工能用；
+    # 节假日不开盖；2026-07-31 上线前把工作时间档从 900 秒收紧到 240 秒）：
+    #   - 工作时间（周一~周五 08:00-19:59）：240 秒，尽快自愈，保证员工能用；
     #   - 非工作时间：6 小时。合盖睡眠期间线程被冻结、不计时；开盖唤醒后第一次
     #     检查必然超预算 → 立即退出 → launchd 拉起全新进程，正好完成"早晨开工前
     #     自动获得干净连接"的效果，又不会在整个夜间/周末反复空转重启。
-    # 已知取舍：reset_failure 只在收到用户消息时触发，若 WS 断开后 SDK 自行重连成功
-    # 但一直没人发消息，本计时器会误杀一次健康进程——launchd 会立即拉起，
-    # 代价仅一次 reranker 重载，且新进程 _first_fail 为空不会循环；可接受。
+    # 故障起点由两个来源标记，取先到者：SDK on_reconnecting 钩子（最准）、
+    # 错误日志特征串（兜底）；复位由 SDK on_reconnected 钩子或收到用户消息触发。
     def _fail_budget() -> float:
         lt = _time.localtime()
         if lt.tm_wday < 5 and 8 <= lt.tm_hour < 20:
-            return _FAIL_EXIT_AFTER
+            return _FAIL_EXIT_AFTER_WORK
         return 6 * 3600
 
     def _fail_timer():
@@ -1650,12 +2035,52 @@ def main():
             _time.sleep(60)
             first = _fail_handler._first_fail
             budget = _fail_budget()
-            if first is not None and _time.time() - first >= budget:
-                log.warning("WS 失败后 %.0f 秒内无任何恢复迹象（SDK 静默卡死），主动退出等待 launchd 重启",
-                            budget)
-                os._exit(1)
+            if first is not None:
+                if _time.time() - first >= budget:
+                    log.warning("WS 失败后 %.0f 秒内无任何恢复迹象（SDK 静默卡死），主动退出等待 launchd 重启",
+                                budget)
+                    os._exit(1)
+                if _time.time() - _last_ws_event > budget:
+                    log.warning("WS 僵尸态：失败后 %.0f 秒内未收到任何 WS 事件，主动退出等待 launchd 重启",
+                                budget)
+                    os._exit(1)
 
     threading.Thread(target=_fail_timer, daemon=True).start()
+
+    # ── SASE fake-IP 劫持检测（2026-08-10）──────────────────────────────
+    # 公司零信任客户端（SASE）可能把 WS 域名解析成 fake-IP（198.18/198.19 段，
+    # 走 utun0 隧道），隧道扛不住长连接心跳，连上必死——表现为凌晨多次
+    # keepalive ping timeout。确认劫持后立即退出，launchd 秒级拉起重新解析。
+    # 防误杀（08-10 两次实测教训）：短期 API 调用和 LLM 网关连接池也会合法
+    # 走隧道且可能长存。必须同时满足两个条件才杀：
+    #   1. 同一 fake-IP 端点连续 2 次检查（间隔 60s）都在 → 证明是长连接
+    #   2. SDK 同时出现失败迹象（_fail_handler._first_fail 非空）→ 证明 WS
+    #      真的在故障。WS 健康时仅凭 IP 绝不杀。
+    def _hijack_guard():
+        prev_fake = None
+        while True:
+            _time.sleep(60)
+            try:
+                out = subprocess.check_output(
+                    ["/usr/sbin/lsof", "-a", "-i", "-P", "-n", "-p", str(os.getpid())],
+                    text=True, timeout=10, stderr=subprocess.DEVNULL,
+                )
+                cur_fake = None
+                for line in out.splitlines():
+                    if "ESTABLISHED" in line and ("->198.18." in line or "->198.19." in line):
+                        cur_fake = line.strip()[-60:]
+                        break
+                ws_failing = _fail_handler is not None and _fail_handler._first_fail is not None
+                if cur_fake and cur_fake == prev_fake and ws_failing:
+                    log.warning("确认 WS 被 SASE 劫持进 fake-IP 隧道（长连接+SDK故障双重确认），主动退出换真实路径: %s",
+                                cur_fake)
+                    os._exit(1)
+                prev_fake = cur_fake
+            except Exception:
+                prev_fake = None
+
+    threading.Thread(target=_hijack_guard, daemon=True).start()
+
 
     # 进程内重连循环（2026-07-16 新增）：
     # 背景：公司 SASE 零信任客户端会间歇性把这条 WS 长连接拦截/掐断，SDK 自身的
@@ -1667,6 +2092,16 @@ def main():
     # 死透），就在同一个进程里直接 new 一个全新的 ws.Client 再 start()，完全不碰
     # 模型/索引，恢复速度快得多。真正卡死不返回的极端情况，交给上面的
     # _FailExitHandler 兜底退出整个进程，靠 launchd KeepAlive 拉起。
+    # 2026-09-23 Lark SG 网关降级：握手经常超过 websockets 默认 open_timeout=10s，
+    # 连上后 ping 默认 20s 等不到 pong 又被打断。放宽到 30s/90s 扛慢网关；
+    # 网关恢复后这些值也无副作用（只是更耐心），可长期保留。
+    import lark_oapi.ws.client as _lark_ws_mod
+    _orig_ws_kwargs = _lark_ws_mod._ws_connect_kwargs
+    def _ws_kwargs_patched():
+        kw = _orig_ws_kwargs()
+        kw.update(open_timeout=30, ping_interval=30, ping_timeout=90)
+        return kw
+    _lark_ws_mod._ws_connect_kwargs = _ws_kwargs_patched
     _ws_attempt = 0
     while True:
         _ws_attempt += 1
@@ -1678,6 +2113,10 @@ def main():
                 domain=lark.LARK_DOMAIN,
                 log_level=lark.LogLevel.WARNING,
             )
+            # SDK 观察者钩子（lark_oapi ws.Client 提供，默认 no-op）：
+            # 让熔断计时跟 SDK 的真实重连生命周期对齐，而不是靠日志猜。
+            ws.on_reconnecting = _on_ws_reconnecting
+            ws.on_reconnected = _on_ws_reconnected
             log.info("WS 长连接启动（第 %d 次尝试）", _ws_attempt)
             if _ws_attempt > 1:
                 try:

@@ -10,6 +10,8 @@ import os
 import threading
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")      # 模型已本地缓存，DNS 故障不阻塞启动
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 log = logging.getLogger(__name__)
 

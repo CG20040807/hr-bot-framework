@@ -55,14 +55,13 @@ _SKIP_FILES = {
 MIN_CONTENT_LEN = 80   # 内容太短（纯标题/导航）跳过
 
 
-def _llm_call(messages: list, max_tokens: int = 800, temperature: float = 0.1) -> str:
+def _llm_call(messages: list, max_tokens: int = 800, temperature: float = 0.1) -> str:  # temperature 保留签名兼容，但部分后端只支持=1，不传
     for attempt in range(3):
         try:
             resp = _llm.chat.completions.create(
                 model=LLM_MODEL,
                 messages=messages,
                 max_tokens=max_tokens,
-                temperature=temperature,
             )
             content = resp.choices[0].message.content
             return content.strip() if content else ""
@@ -149,7 +148,7 @@ def generate_cases(sections: list[dict]) -> list[dict]:
 # Phase 2 — 运行 bot
 # ════════════════════════════════════════════════════════════════════════════════
 
-def run_bot(cases: list[dict], workers: int = 4) -> list[dict]:
+def run_bot(cases: list[dict], workers: int = 2) -> list[dict]:
     from kb import search
     from llm import answer as llm_answer
 
@@ -159,6 +158,7 @@ def run_bot(cases: list[dict], workers: int = 4) -> list[dict]:
 
     def _run_one(case: dict) -> dict:
         q = case["question"]
+        time.sleep(1.0)  # 限速：防 LLM 网关 WAF 封 IP
         try:
             chunks = search(q)
             ans = llm_answer(q, chunks)
@@ -272,14 +272,14 @@ def grade_one(run: dict) -> dict:
     chunk_sources = run.get("chunk_sources", [])
     grade["link_ok"] = (expected_file in chunk_sources) if expected_file and chunk_sources else None
 
-    time.sleep(0.4)
+    time.sleep(1.0)  # 限速：防 LLM 网关 WAF 封 IP
     return grade
 
 
 def grade_all(runs: list[dict]) -> list[dict]:
     grades = []
     total = len(runs)
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         futures = {ex.submit(grade_one, r): i for i, r in enumerate(runs)}
         done = 0
         for fut in as_completed(futures):
